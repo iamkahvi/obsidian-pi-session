@@ -1,0 +1,9 @@
+{
+  "id": "pi-session",
+  "name": "Pi Session",
+  "version": "0.0.1",
+  "minAppVersion": "1.0.0",
+  "description": "Render a card for a Pi session ID.",
+  "author": "kahvi",
+  "isDesktopOnly": true
+}

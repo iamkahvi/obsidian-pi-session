@@ -1,0 +1,13 @@
+.pi-session-card {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: var(--background-secondary);
+}
+.pi-session-title { font-weight: 600; font-size: 1.1em; margin-bottom: 4px; }
+.pi-session-meta, .pi-session-id { color: var(--text-muted); font-size: 0.85em; }
+.pi-session-id { margin-top: 8px; font-family: var(--font-monospace); }
+.pi-session-row { margin-top: 8px; }
+.pi-session-label { font-size: 0.8em; text-transform: uppercase; color: var(--text-faint); }
+.pi-session-text { white-space: pre-wrap; }
+.pi-session-error { color: var(--text-error); }
