@@ -13,21 +13,62 @@ const DEFAULT_SETTINGS = {
   buttonLabel: "",
   customCommand: "",
   customArguments: "[]",
+  piExecutable: "",
 };
 
 // Obsidian does not get the login shell PATH, so use absolute paths.
 const HC = path.join(HOME, ".local", "bin", "hc");
 const HERDR_APP = path.join(HOME, ".local", "bin", "herdr-app");
 const HERDR = "/opt/homebrew/bin/herdr";
-const PI = path.join(HOME, ".local", "state", "tec", "toolchain", "base_profile", "bin", "pi");
 const HERDR_APP_BUNDLE = "dev.herdr.app";
 // TEMPORARY: false lets the button open a session that is live in the Herdr TUI.
 // Two Pi processes then write to the same session file.
 const BLOCK_IF_LIVE_IN_HERDR_TUI = false;
 const ENV = {
   ...process.env,
-  PATH: [path.join(HOME, ".local", "bin"), "/opt/homebrew/bin", "/usr/bin", "/bin", process.env.PATH].join(":"),
+  PATH: [path.join(HOME, ".local", "bin"), "/opt/homebrew/bin", "/usr/bin", "/bin", process.env.PATH].filter(Boolean).join(":"),
 };
+
+function expandHome(value) {
+  if (value === "~") return HOME;
+  return value.startsWith("~/") ? path.join(HOME, value.slice(2)) : value;
+}
+
+function isExecutable(file) {
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function detectPiExecutable() {
+  const pathCandidates = (process.env.PATH || "")
+    .split(path.delimiter)
+    .filter(Boolean)
+    .map((dir) => path.join(dir, "pi"));
+  const standardCandidates = [
+    path.join(HOME, ".bun", "bin", "pi"),
+    path.join(HOME, ".local", "bin", "pi"),
+    "/opt/homebrew/bin/pi",
+    "/usr/local/bin/pi",
+    path.join(HOME, ".local", "state", "tec", "toolchain", "base_profile", "bin", "pi"),
+  ];
+  return [...new Set([...pathCandidates, ...standardCandidates])].find(isExecutable) || null;
+}
+
+function findPiExecutable(configuredPath) {
+  if (configuredPath.trim()) {
+    const executable = expandHome(configuredPath.trim());
+    if (isExecutable(executable)) return executable;
+    throw new Error(`Configured Pi executable is not executable: ${executable}`);
+  }
+
+  const executable = detectPiExecutable();
+  if (executable) return executable;
+  throw new Error("Pi executable not found. Set it in Settings → Community plugins → Pi Session.");
+}
 
 function run(bin, args) {
   return new Promise((resolve, reject) => {
@@ -86,7 +127,7 @@ async function ensureHerdrApp() {
   throw new Error("Herdr.app did not start in 10 s");
 }
 
-async function openInHerdrApp(file, id, cwd) {
+async function openInHerdrApp(settings, file, id, cwd) {
   const tui = BLOCK_IF_LIVE_IN_HERDR_TUI ? await findInHerdrTui(file, id) : null;
   if (tui) return `Live in Herdr TUI (session ${tui.session}, pane ${tui.pane}). Not opened.`;
   await ensureHerdrApp();
@@ -97,7 +138,8 @@ async function openInHerdrApp(file, id, cwd) {
     msg = `Focused ${terminal} in Herdr.app.`;
   } else {
     if (!cwd || !fs.existsSync(cwd)) throw new Error(`cwd does not exist: ${cwd}`);
-    const out = JSON.parse(await run(HERDR_APP, ["do", "tab.new", "--folder", cwd, "--argv", JSON.stringify([PI, "--session", file])]));
+    const pi = findPiExecutable(settings.piExecutable);
+    const out = JSON.parse(await run(HERDR_APP, ["do", "tab.new", "--folder", cwd, "--argv", JSON.stringify([pi, "--session", file])]));
     msg = `Opened ${out.terminal} in Herdr.app.`;
   }
   await run("/usr/bin/open", ["-b", HERDR_APP_BUNDLE]);
@@ -232,7 +274,19 @@ class PiSessionSettingsTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    if (settings.openTarget !== "custom-command") return;
+    if (settings.openTarget === "herdr-app") {
+      new Setting(containerEl)
+        .setName("Pi executable")
+        .setDesc("Absolute path to Pi. Leave empty to auto-detect it from PATH and common install locations.")
+        .addText((text) => text
+          .setPlaceholder(detectPiExecutable() || "Auto-detect")
+          .setValue(settings.piExecutable)
+          .onChange(async (value) => {
+            settings.piExecutable = value;
+            await this.plugin.saveSettings();
+          }));
+      return;
+    }
 
     new Setting(containerEl)
       .setName("Command")
@@ -297,7 +351,7 @@ module.exports = class PiSessionPlugin extends Plugin {
         try {
           const result = this.settings.openTarget === "custom-command"
             ? await openWithCustomCommand(this.settings, file, id, s.cwd)
-            : await openInHerdrApp(file, id, s.cwd);
+            : await openInHerdrApp(this.settings, file, id, s.cwd);
           new Notice(result);
         } catch (e) {
           new Notice(`Pi Session: ${e.message}`, 8000);

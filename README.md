@@ -20,7 +20,7 @@ The card has an "Open in Herdr.app" button:
 2. If a live Herdr.app terminal runs `pi --session <this session>`, the plugin focuses it.
 3. If not, the plugin opens a new Herdr.app tab in the session `cwd` and resumes the session.
 
-The plugin starts Herdr.app if it is not running. It uses `~/.local/bin/hc`, `~/.local/bin/herdr-app`, `/opt/homebrew/bin/herdr`, and the `tec` `pi` at `~/.local/state/tec/toolchain/base_profile/bin/pi`.
+The plugin starts Herdr.app if it is not running. It uses `~/.local/bin/hc`, `~/.local/bin/herdr-app`, and `/opt/homebrew/bin/herdr`.
 
 ## Open button settings
 
@@ -28,6 +28,7 @@ Open **Settings → Community plugins → Pi Session** to configure the card act
 
 - **Show open button** hides or displays the action on every Pi session card.
 - **Open target** chooses either **Herdr.app** (the default) or a **Custom command**.
+- For the Herdr.app target, **Pi executable** accepts an explicit executable path. Leave it empty to detect Pi from the app `PATH`, `~/.bun/bin/pi`, `~/.local/bin/pi`, Homebrew, or the former `tec` location.
 - A custom command is run without a shell. Its arguments must be a JSON array of strings, so paths and session content cannot be interpreted as shell syntax. Arguments may contain these placeholders:
   - `{sessionFile}`: absolute path to the Pi JSONL session
   - `{sessionId}`: the ID in the `pi-session` code block
