@@ -22,6 +22,20 @@ The card has an "Open in Herdr.app" button:
 
 The plugin starts Herdr.app if it is not running. It uses `~/.local/bin/hc`, `~/.local/bin/herdr-app`, `/opt/homebrew/bin/herdr`, and the `tec` `pi` at `~/.local/state/tec/toolchain/base_profile/bin/pi`.
 
+## Open button settings
+
+Open **Settings → Community plugins → Pi Session** to configure the card action:
+
+- **Show open button** hides or displays the action on every Pi session card.
+- **Open target** chooses either **Herdr.app** (the default) or a **Custom command**.
+- A custom command is run without a shell. Its arguments must be a JSON array of strings, so paths and session content cannot be interpreted as shell syntax. Arguments may contain these placeholders:
+  - `{sessionFile}`: absolute path to the Pi JSONL session
+  - `{sessionId}`: the ID in the `pi-session` code block
+  - `{cwd}`: the session working directory
+
+For example, a command of `/path/to/your-launcher` with arguments
+`["--session", "{sessionFile}", "--cwd", "{cwd}"]` passes the selected session to that launcher.
+
 ## Install
 
 Copy `main.js`, `manifest.json`, and `styles.css` to `<vault>/.obsidian/plugins/pi-session/`. Then turn on "Pi Session" in Settings > Community plugins.

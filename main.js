@@ -1,4 +1,4 @@
-const { Plugin, Notice } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, Notice } = require("obsidian");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -7,6 +7,13 @@ const { execFile } = require("child_process");
 const HOME = os.homedir();
 const SESSIONS_DIR = path.join(HOME, ".pi", "agent", "sessions");
 const MAX_CHARS = 300;
+const DEFAULT_SETTINGS = {
+  openEnabled: true,
+  openTarget: "herdr-app",
+  buttonLabel: "",
+  customCommand: "",
+  customArguments: "[]",
+};
 
 // Obsidian does not get the login shell PATH, so use absolute paths.
 const HC = path.join(HOME, ".local", "bin", "hc");
@@ -97,6 +104,36 @@ async function openInHerdrApp(file, id, cwd) {
   return msg;
 }
 
+function openButtonLabel(settings) {
+  if (settings.buttonLabel.trim()) return settings.buttonLabel.trim();
+  return settings.openTarget === "herdr-app" ? "Open in Herdr.app" : "Open session";
+}
+
+function expandArgument(value, file, id, cwd) {
+  return value
+    .replaceAll("{sessionFile}", file)
+    .replaceAll("{sessionId}", id)
+    .replaceAll("{cwd}", cwd || "");
+}
+
+async function openWithCustomCommand(settings, file, id, cwd) {
+  const command = settings.customCommand.trim();
+  if (!command) throw new Error("Custom command is empty. Configure it in Pi Session settings.");
+
+  let args;
+  try {
+    args = JSON.parse(settings.customArguments || "[]");
+  } catch {
+    throw new Error("Custom arguments must be a JSON array of strings.");
+  }
+  if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) {
+    throw new Error("Custom arguments must be a JSON array of strings.");
+  }
+
+  await run(command, args.map((arg) => expandArgument(arg, file, id, cwd)));
+  return `Ran ${command}.`;
+}
+
 function findSessionFile(id) {
   if (!fs.existsSync(SESSIONS_DIR)) return null;
   for (const dir of fs.readdirSync(SESSIONS_DIR)) {
@@ -147,8 +184,85 @@ function parseSession(file) {
   return info;
 }
 
+class PiSessionSettingsTab extends PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display() {
+    const { containerEl } = this;
+    const { settings } = this.plugin;
+    containerEl.empty();
+
+    new Setting(containerEl)
+      .setName("Show open button")
+      .setDesc("Show an action button on Pi session cards.")
+      .addToggle((toggle) => toggle
+        .setValue(settings.openEnabled)
+        .onChange(async (value) => {
+          settings.openEnabled = value;
+          await this.plugin.saveSettings();
+          this.display();
+        }));
+
+    if (!settings.openEnabled) return;
+
+    new Setting(containerEl)
+      .setName("Open target")
+      .setDesc("Choose where the session button opens the session.")
+      .addDropdown((dropdown) => dropdown
+        .addOption("herdr-app", "Herdr.app")
+        .addOption("custom-command", "Custom command")
+        .setValue(settings.openTarget)
+        .onChange(async (value) => {
+          settings.openTarget = value;
+          await this.plugin.saveSettings();
+          this.display();
+        }));
+
+    new Setting(containerEl)
+      .setName("Button label")
+      .setDesc(`Leave empty for “${openButtonLabel({ ...settings, buttonLabel: "" })}”.`)
+      .addText((text) => text
+        .setPlaceholder(openButtonLabel({ ...settings, buttonLabel: "" }))
+        .setValue(settings.buttonLabel)
+        .onChange(async (value) => {
+          settings.buttonLabel = value;
+          await this.plugin.saveSettings();
+        }));
+
+    if (settings.openTarget !== "custom-command") return;
+
+    new Setting(containerEl)
+      .setName("Command")
+      .setDesc("Executable path or command name to run when opening a session.")
+      .addText((text) => text
+        .setPlaceholder("/usr/bin/open")
+        .setValue(settings.customCommand)
+        .onChange(async (value) => {
+          settings.customCommand = value;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Arguments")
+      .setDesc("JSON array of arguments. Use {sessionFile}, {sessionId}, and {cwd} as placeholders.")
+      .addTextArea((text) => text
+        .setPlaceholder('["--session", "{sessionFile}"]')
+        .setValue(settings.customArguments)
+        .onChange(async (value) => {
+          settings.customArguments = value;
+          await this.plugin.saveSettings();
+        }));
+  }
+}
+
 module.exports = class PiSessionPlugin extends Plugin {
-  onload() {
+  async onload() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.addSettingTab(new PiSessionSettingsTab(this.app, this));
+
     this.registerMarkdownCodeBlockProcessor("pi-session", (source, el) => {
       const id = source.trim();
       const card = el.createDiv({ cls: "pi-session-card" });
@@ -175,11 +289,16 @@ module.exports = class PiSessionPlugin extends Plugin {
       row("Last reply", s.lastAssistant);
       const footer = card.createDiv({ cls: "pi-session-footer" });
       footer.createDiv({ cls: "pi-session-id", text: id });
-      const btn = footer.createEl("button", { text: "Open in Herdr.app" });
+      if (!this.settings.openEnabled) return;
+
+      const btn = footer.createEl("button", { text: openButtonLabel(this.settings) });
       btn.addEventListener("click", async () => {
         btn.disabled = true;
         try {
-          new Notice(await openInHerdrApp(file, id, s.cwd));
+          const result = this.settings.openTarget === "custom-command"
+            ? await openWithCustomCommand(this.settings, file, id, s.cwd)
+            : await openInHerdrApp(file, id, s.cwd);
+          new Notice(result);
         } catch (e) {
           new Notice(`Pi Session: ${e.message}`, 8000);
         } finally {
@@ -187,5 +306,9 @@ module.exports = class PiSessionPlugin extends Plugin {
         }
       });
     });
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
   }
 };
