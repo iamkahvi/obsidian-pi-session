@@ -8,6 +8,7 @@ const { randomUUID } = require("crypto");
 const HOME = os.homedir();
 const SESSIONS_DIR = path.join(HOME, ".pi", "agent", "sessions");
 const MAX_CHARS = 300;
+const MAX_TAB_CHARS = 40;
 const DEFAULT_SETTINGS = {
   openEnabled: true,
   openTarget: "rex",
@@ -113,19 +114,39 @@ async function showInRex(rex, sessionId, windowId) {
   throw new Error("Rex app did not connect. Select the vault session in Rex.");
 }
 
+const piLabel = (id) => `pi:${id}`;
+
+function tabLabel(name) {
+  const clean = (name || "").replace(/\s+/g, " ").trim();
+  return clean.length > MAX_TAB_CHARS ? `${clean.slice(0, MAX_TAB_CHARS - 3)}...` : clean;
+}
+
+// The block label keeps the session ID, so the window label can show the Pi session name.
+async function nameRexWindow(rex, target, name) {
+  const label = tabLabel(name);
+  if (!label || !target.blockId) return;
+  try {
+    await run(rex, ["block", "rename", "-s", target.sessionId, "--", target.blockId, piLabel(target.id)]);
+    await run(rex, ["window", "rename", "-s", target.sessionId, "--", target.windowId, label]);
+  } catch (error) {
+    new Notice(`Pi Session: Could not name the Rex tab. ${error.message}`, 8000);
+  }
+}
+
 let rexWindowQueue = Promise.resolve();
 
 function createRexWindow(settings, rex, id, cwd, piArgs) {
   const create = async () => {
     const session = await findVaultSession(rex);
-    const label = `pi:${id}`;
+    const label = piLabel(id);
     const piCommand = [findPiExecutable(settings.piExecutable), ...piArgs];
     if (session) {
       const result = await rexJson(rex, ["window", "new", "-s", session.session_id, label, "-c", cwd, "--json", "--", ...piCommand]);
-      return { sessionId: session.session_id, windowId: result.window_id };
+      return { id, sessionId: session.session_id, windowId: result.window_id, blockId: result.block_ids?.[0] };
     }
     const result = await rexJson(rex, ["new", REX_SESSION, "-c", cwd, "--window", label, "--json", "--", ...piCommand]);
-    return { sessionId: result.session_id, windowId: result.initial_windows[0].window_id };
+    const window = result.initial_windows[0];
+    return { id, sessionId: result.session_id, windowId: window.window_id, blockId: window.block_ids?.[0] };
   };
   const result = rexWindowQueue.then(create);
   rexWindowQueue = result.catch(() => {});
@@ -134,25 +155,27 @@ function createRexWindow(settings, rex, id, cwd, piArgs) {
 
 async function findRexWindow(rex, session, id) {
   const result = await rexJson(rex, ["window", "ls", "-s", session.session_id, "--json"]);
-  const window = (result.windows || []).find((item) => item.label === `pi:${id}`);
-  if (!window) return null;
-  const blocks = (window.layers || []).flatMap((layer) => layer.blocks || []);
-  for (const block of blocks) {
-    if (block.creator_name !== "com.superlogical.terminal") continue;
-    const processInfo = await rexJson(rex, ["block", "call", "-s", session.session_id, "-b", block.block_id, "process"]);
-    if (processInfo.last_exit === null) return window.window_id;
+  for (const window of result.windows || []) {
+    const blocks = (window.layers || []).flatMap((layer) => layer.blocks || [])
+      .filter((block) => block.creator_name === "com.superlogical.terminal");
+    const labeled = blocks.filter((block) => block.label === piLabel(id));
+    // Older versions put the session ID on the window label.
+    const candidates = labeled.length ? labeled : window.label === piLabel(id) ? blocks : [];
+    for (const block of candidates) {
+      const processInfo = await rexJson(rex, ["block", "call", "-s", session.session_id, "-b", block.block_id, "process"]);
+      if (processInfo.last_exit === null) return { id, sessionId: session.session_id, windowId: window.window_id, blockId: block.block_id };
+    }
   }
   return null;
 }
 
-async function openInRex(settings, file, id, cwd) {
+async function openInRex(settings, file, id, cwd, name) {
   if (!cwd || !fs.existsSync(cwd)) throw new Error(`cwd does not exist: ${cwd}`);
   const rex = findRexExecutable();
   const session = await findVaultSession(rex);
   const liveWindow = session && await findRexWindow(rex, session, id);
-  const target = liveWindow
-    ? { sessionId: session.session_id, windowId: liveWindow }
-    : await createRexWindow(settings, rex, id, cwd, ["--session", file]);
+  const target = liveWindow || await createRexWindow(settings, rex, id, cwd, ["--session", file]);
+  await nameRexWindow(rex, target, name);
   await showInRex(rex, target.sessionId, target.windowId);
   return liveWindow ? "Focused the Pi session in Rex." : "Opened the Pi session in Rex.";
 }
@@ -374,7 +397,7 @@ module.exports = class PiSessionPlugin extends Plugin {
         try {
           const result = this.settings.openTarget === "custom-command"
             ? await openWithCustomCommand(this.settings, file, id, s.cwd)
-            : await openInRex(this.settings, file, id, s.cwd);
+            : await openInRex(this.settings, file, id, s.cwd, parseSession(file).name);
           new Notice(result);
         } catch (e) {
           new Notice(`Pi Session: ${e.message}`, 8000);
@@ -418,6 +441,7 @@ module.exports = class PiSessionPlugin extends Plugin {
         await sleep(200);
       }
       if (!sessionFile) throw new Error(`Pi did not save the prompt. Session ID: ${id}`);
+      await nameRexWindow(rex, target, parseSession(sessionFile).name);
       if (view.file !== file || editor.getValue() !== original) {
         throw new Error(`The note changed. The selection was not replaced. Session ID: ${id}`);
       }

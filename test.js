@@ -42,12 +42,13 @@ function fixture(options = {}) {
       if (marker !== -1 && options.savePrompt !== false) {
         fs.mkdirSync(sessionDir, { recursive: true });
         const message = { type: "message", message: { role: "user", content: args[marker + 3] } };
-        fs.writeFileSync(path.join(sessionDir, `test_${ID}.jsonl`), JSON.stringify(message) + "\n");
+        const entries = options.name ? [{ type: "session_info", name: options.name }, message] : [message];
+        fs.writeFileSync(path.join(sessionDir, `test_${ID}.jsonl`), entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
       }
       if (options.afterLaunch) options.afterLaunch();
       result = args[0] === "new"
-        ? { session_id: "session:new", initial_windows: [{ window_id: "window:new" }] }
-        : { window_id: "window:new" };
+        ? { session_id: "session:new", initial_windows: [{ window_id: "window:new", block_ids: ["block:new"] }] }
+        : { window_id: "window:new", block_ids: ["block:new"] };
     } else if (args[0] === "client") {
       result = { clients: [{ client_id: "client:app", info: { kind: "app" }, connection_state: "connected" }] };
     }
@@ -144,6 +145,36 @@ test("focuses a live Pi tab rather than opening a second writer", async (t) => {
   const result = await f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home);
   assert.equal(result, "Focused the Pi session in Rex.");
   assert.equal(f.calls.some(({ args }) => args[0] === "window" && args[1] === "new"), false);
+  assert.ok(f.calls.some(({ args }) => args.includes("window_id=window:live")));
+});
+
+test("names the Rex tab after the Pi session and keeps the ID on the block", async (t) => {
+  const f = fixture({ name: "  -fix   the flaky checkout test in the storefront suite" }); t.after(f.cleanup);
+  await f.plugin.onload();
+  await f.plugin.startSession(f.editor, { file: {} });
+  const rename = (kind) => f.calls.find(({ args }) => args[0] === kind && args[1] === "rename")?.args;
+  assert.deepEqual(rename("block"), ["block", "rename", "-s", "session:vault", "--", "block:new", `pi:${ID}`]);
+  assert.deepEqual(rename("window"), ["window", "rename", "-s", "session:vault", "--", "window:new", "-fix the flaky checkout test in the s..."]);
+});
+
+test("keeps the ID label when the Pi session has no name", async (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  await f.plugin.onload();
+  await f.plugin.startSession(f.editor, { file: {} });
+  assert.equal(f.calls.some(({ args }) => args[1] === "rename"), false);
+});
+
+test("finds a live Pi tab by its block label", async (t) => {
+  const windows = [
+    { label: "other", window_id: "window:other", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:other", label: "shell" }] }] },
+    { label: "readable name", window_id: "window:live", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:live", label: `pi:${ID}` }] }] },
+  ];
+  const f = fixture({ windows }); t.after(f.cleanup);
+  await f.plugin.onload();
+  const result = await f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home, "new name");
+  assert.equal(result, "Focused the Pi session in Rex.");
+  assert.equal(f.calls.some(({ args }) => args[0] === "window" && args[1] === "new"), false);
+  assert.ok(f.calls.some(({ args }) => args.join(" ") === "window rename -s session:vault -- window:live new name"));
   assert.ok(f.calls.some(({ args }) => args.includes("window_id=window:live")));
 });
 
