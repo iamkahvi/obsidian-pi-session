@@ -1,6 +1,29 @@
 # obsidian-pi-session
 
-An Obsidian plugin that shows a card for a Pi session. Put a session ID in a `pi-session` code block:
+Start and view Pi sessions in Obsidian. Desktop only.
+
+![Example Pi session card with sample data](assets/session-card.png)
+
+## Install
+
+1. Install Pi and Rex.
+2. Copy `main.js`, `manifest.json`, and `styles.css` to `<vault>/.obsidian/plugins/pi-session/`.
+3. Enable **Pi Session** in Obsidian community plugins.
+
+The plugin reads sessions from `~/.pi/agent/sessions/`.
+
+## Start a session
+
+1. Select text in a note.
+2. Run **Pi Session: Start Pi session from selection** from the command palette.
+
+Rex uses or creates the `vault` session. Pi uses `$HOME` as its `cwd`. After Pi saves the prompt, the plugin replaces the text with a `pi-session` block.
+
+If the note changes or Pi saves no prompt within 60 seconds, the plugin keeps the text. A notice gives the session ID. Pi can treat prompts that start with `/` as commands. The plugin adds a space before prompts that start with `@`.
+
+## Open a session
+
+Click **Open in Rex** to focus or resume a session. To add a card yourself, use a session ID:
 
 ````markdown
 ```pi-session
@@ -8,43 +31,14 @@ An Obsidian plugin that shows a card for a Pi session. Put a session ID in a `pi
 ```
 ````
 
-The card shows the session name, start time, `cwd`, model, message counts, the first prompt, and the last reply.
+Do not open a Pi session in two processes. The plugin cannot detect sessions outside its Rex tabs. Cards do not update automatically.
 
-The plugin reads session files from `~/.pi/agent/sessions/`. It works only on desktop. It does not use an LLM.
+## Settings
 
-## Start a session
+Use **Settings → Community plugins → Pi Session** to choose the button target and Pi executable path.
 
-Select text in a note and run **Pi Session: Start Pi session from selection** from the command palette. The plugin opens Pi in a tab in the Rex session named `vault`. It creates that Rex session if necessary. Pi uses `$HOME` as its working directory.
-
-After Pi saves the first prompt, the plugin replaces the selection with a `pi-session` block. If the note changes or Pi does not save the prompt within 60 seconds, the plugin leaves the note unchanged. A notice gives the session ID so you can add the block yourself.
-
-Pi treats a prompt that starts with `@` as a file argument. The plugin adds a space before that prompt to preserve its text. Pi can also interpret prompts that start with `/` as commands. If a command does not save a prompt, the plugin leaves the note unchanged.
-
-## Open in Rex
-
-The card has an **Open in Rex** button. It focuses an existing Pi tab that the plugin created in the `vault` session. If no such tab is active, it opens a new tab and resumes Pi in the session's original working directory. The plugin starts Rex if necessary.
-
-The plugin cannot detect a session that you opened outside its own Rex tabs. Do not open the same Pi session in two processes.
-
-## Open button settings
-
-Open **Settings → Community plugins → Pi Session** to configure the card action:
-
-- **Show open button** hides or displays the action on every Pi session card.
-- **Open target** chooses either **Rex** (the default) or a **Custom command**.
-- **Pi executable** accepts an explicit executable path. Leave it empty to detect Pi from the app `PATH`, `~/.bun/bin/pi`, `~/.local/bin/pi`, Homebrew, or the former `tec` location. This setting also applies to new sessions.
-- A custom command is run without a shell. Its arguments must be a JSON array of strings, so paths and session content cannot be interpreted as shell syntax. Arguments may contain these placeholders:
-  - `{sessionFile}`: absolute path to the Pi JSONL session
-  - `{sessionId}`: the ID in the `pi-session` code block
-  - `{cwd}`: the session working directory
-
-For example, a command of `/path/to/your-launcher` with arguments
-`["--session", "{sessionFile}", "--cwd", "{cwd}"]` passes the selected session to that launcher.
-
-## Install
-
-Copy `main.js`, `manifest.json`, and `styles.css` to `<vault>/.obsidian/plugins/pi-session/`. Then turn on "Pi Session" in Settings > Community plugins. Install Pi and Rex on the same desktop. The plugin reads Pi sessions from the default directory, `~/.pi/agent/sessions/`.
+Custom command arguments must be a JSON array of strings. Use `{sessionFile}`, `{sessionId}`, and `{cwd}` as placeholders. The plugin runs custom commands without a shell.
 
 ## Test
 
-Run `node --test test.js`. The tests use a mock Rex CLI and do not open a Rex tab.
+Run `node --test test.js`.
