@@ -31,11 +31,13 @@ Click **Open in Rex** to focus or resume a session. To add a card yourself, use 
 ```
 ````
 
-Do not open a Pi session in two processes. The plugin cannot detect sessions outside its Rex tabs. Cards do not update automatically.
+Do not open a Pi session in two processes. The plugin cannot detect sessions outside its Rex tabs. Cards do not update automatically. Run **Pi Session: Refresh Pi session cards** to update them.
 
 ## Settings
 
 Use **Settings → Community plugins → Pi Session** to choose the button target and Pi executable path.
+
+Set **Card layout** to **Compact** to show only the title, start time, message count, session ID, and button.
 
 Custom command arguments must be a JSON array of strings. Use `{sessionFile}`, `{sessionId}`, and `{cwd}` as placeholders. The plugin runs custom commands without a shell.
 

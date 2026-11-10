@@ -12,3 +12,6 @@
 .pi-session-label { font-size: 0.8em; text-transform: uppercase; color: var(--text-faint); }
 .pi-session-text { white-space: pre-wrap; }
 .pi-session-error { color: var(--text-error); }
+.pi-session-compact { padding: 8px 12px; }
+.pi-session-compact .pi-session-title { font-size: 1em; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pi-session-compact .pi-session-footer { margin-top: 4px; }

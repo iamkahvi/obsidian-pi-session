@@ -10,6 +10,7 @@ const SESSIONS_DIR = path.join(HOME, ".pi", "agent", "sessions");
 const MAX_CHARS = 300;
 const MAX_TAB_CHARS = 40;
 const DEFAULT_SETTINGS = {
+  cardLayout: "default",
   openEnabled: true,
   openTarget: "rex",
   buttonLabel: "",
@@ -283,6 +284,19 @@ class PiSessionSettingsTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName("Card layout")
+      .setDesc("Compact shows only the title, start time, message count, session ID, and button.")
+      .addDropdown((dropdown) => dropdown
+        .addOption("default", "Default")
+        .addOption("compact", "Compact")
+        .setValue(settings.cardLayout)
+        .onChange(async (value) => {
+          settings.cardLayout = value;
+          await this.plugin.saveSettings();
+          this.plugin.refreshCards();
+        }));
+
+    new Setting(containerEl)
       .setName("Show open button")
       .setDesc("Show an action button on Pi session cards.")
       .addToggle((toggle) => toggle
@@ -360,17 +374,53 @@ module.exports = class PiSessionPlugin extends Plugin {
         return true;
       },
     });
+    this.addCommand({
+      id: "refresh-pi-session-cards",
+      name: "Refresh Pi session cards",
+      callback: () => {
+        const count = this.refreshCards();
+        new Notice(`Refreshed ${count} Pi session card${count === 1 ? "" : "s"}.`);
+      },
+    });
 
+    this.cards = new Set();
     this.registerMarkdownCodeBlockProcessor("pi-session", (source, el) => {
-      const id = source.trim();
-      const card = el.createDiv({ cls: "pi-session-card" });
-      const file = id && findSessionFile(id);
-      if (!file) {
-        card.createDiv({ cls: "pi-session-error", text: `Session not found: ${id}` });
-        return;
+      const card = { el, id: source.trim() };
+      this.cards.add(card);
+      this.renderCard(card);
+    });
+  }
+
+  refreshCards() {
+    for (const card of this.cards) {
+      if (!card.el.isConnected) {
+        this.cards.delete(card);
+        continue;
       }
-      const s = parseSession(file);
-      card.createDiv({ cls: "pi-session-title", text: s.name || "(no name)" });
+      card.el.empty();
+      this.renderCard(card);
+    }
+    return this.cards.size;
+  }
+
+  renderCard({ el, id }) {
+    const compact = this.settings.cardLayout === "compact";
+    const card = el.createDiv({ cls: compact ? "pi-session-card pi-session-compact" : "pi-session-card" });
+    const file = id && findSessionFile(id);
+    if (!file) {
+      card.createDiv({ cls: "pi-session-error", text: `Session not found: ${id}` });
+      return;
+    }
+    const s = parseSession(file);
+    card.createDiv({ cls: "pi-session-title", text: s.name || "(no name)" });
+    if (compact) {
+      const messages = s.users + s.assistants;
+      card.createDiv({
+        cls: "pi-session-meta",
+        text: [s.start && new Date(s.start).toLocaleString(), `${messages} message${messages === 1 ? "" : "s"}`]
+          .filter(Boolean).join("  ·  "),
+      });
+    } else {
       const meta = card.createDiv({ cls: "pi-session-meta" });
       meta.setText([
         s.start && new Date(s.start).toLocaleString(),
@@ -385,27 +435,27 @@ module.exports = class PiSessionPlugin extends Plugin {
       };
       row("First prompt", s.firstUser);
       row("Last reply", s.lastAssistant);
-      const footer = card.createDiv({ cls: "pi-session-footer" });
-      footer.createDiv({ cls: "pi-session-id", text: id });
-      if (!this.settings.openEnabled) return;
+    }
+    const footer = card.createDiv({ cls: "pi-session-footer" });
+    footer.createDiv({ cls: "pi-session-id", text: id });
+    if (!this.settings.openEnabled) return;
 
-      const btn = footer.createEl("button", { text: openButtonLabel(this.settings) });
-      btn.addEventListener("click", async () => {
-        if (this.openingSessions.has(id)) return;
-        this.openingSessions.add(id);
-        btn.disabled = true;
-        try {
-          const result = this.settings.openTarget === "custom-command"
-            ? await openWithCustomCommand(this.settings, file, id, s.cwd)
-            : await openInRex(this.settings, file, id, s.cwd, parseSession(file).name);
-          new Notice(result);
-        } catch (e) {
-          new Notice(`Pi Session: ${e.message}`, 8000);
-        } finally {
-          this.openingSessions.delete(id);
-          btn.disabled = false;
-        }
-      });
+    const btn = footer.createEl("button", { text: openButtonLabel(this.settings) });
+    btn.addEventListener("click", async () => {
+      if (this.openingSessions.has(id)) return;
+      this.openingSessions.add(id);
+      btn.disabled = true;
+      try {
+        const result = this.settings.openTarget === "custom-command"
+          ? await openWithCustomCommand(this.settings, file, id, s.cwd)
+          : await openInRex(this.settings, file, id, s.cwd, parseSession(file).name);
+        new Notice(result);
+      } catch (e) {
+        new Notice(`Pi Session: ${e.message}`, 8000);
+      } finally {
+        this.openingSessions.delete(id);
+        btn.disabled = false;
+      }
     });
   }
 

@@ -8,6 +8,31 @@ const vm = require("node:vm");
 const ID = "12345678-1234-4234-8234-123456789abc";
 const SOURCE = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
 
+function fakeEl(tag = "div", options = {}) {
+  return {
+    tag, cls: options.cls || "", text: options.text || "", children: [], isConnected: true,
+    createDiv(o) { return this.createEl("div", o); },
+    createEl(t, o = {}) { const child = fakeEl(t, o); this.children.push(child); return child; },
+    setText(text) { this.text = text; },
+    empty() { this.children = []; },
+    addEventListener() {},
+  };
+}
+
+const texts = (el) => [el.text, ...el.children.flatMap(texts)].filter(Boolean);
+
+function writeSession(home) {
+  const dir = path.join(home, ".pi", "agent", "sessions", "--home--");
+  fs.mkdirSync(dir, { recursive: true });
+  const entries = [
+    { type: "session", cwd: home, timestamp: "2026-01-01T00:00:00Z" },
+    { type: "session_info", name: "fix the test" },
+    { type: "message", message: { role: "user", content: "first prompt" } },
+    { type: "message", message: { role: "assistant", model: "m", content: "last reply" } },
+  ];
+  fs.writeFileSync(path.join(dir, `test_${ID}.jsonl`), entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+}
+
 function fixture(options = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "obsidian-pi-test-"));
   const bin = path.join(home, "bin");
@@ -20,8 +45,8 @@ function fixture(options = {}) {
   class Plugin {
     async loadData() { return options.settings || {}; }
     addSettingTab() {}
-    addCommand(command) { this.command = command; }
-    registerMarkdownCodeBlockProcessor() {}
+    addCommand(command) { this.commands = { ...this.commands, [command.id]: command }; if (!this.command) this.command = command; }
+    registerMarkdownCodeBlockProcessor(name, processor) { this.processor = processor; }
   }
   class Notice { constructor(text) { notices.push(text); } }
   class PluginSettingTab {}
@@ -193,6 +218,58 @@ test("rejects duplicate vault session labels", async (t) => {
   await f.plugin.startSession(f.editor, { file: {} });
   assert.equal(f.editor.text, "before prompt after");
   assert.ok(f.notices.some((notice) => notice.includes("More than one Rex session")));
+});
+
+test("renders the default card with metadata and the last reply", async (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  writeSession(f.home);
+  await f.plugin.onload();
+  const el = fakeEl();
+  f.plugin.processor(`${ID}\n`, el);
+  const shown = texts(el);
+  assert.equal(el.children[0].cls, "pi-session-card");
+  for (const text of ["fix the test", "First prompt", "first prompt", "Last reply", "last reply", ID, "Open in Rex"]) assert.ok(shown.includes(text), text);
+  assert.ok(shown.some((text) => text.includes("1 user / 1 assistant")));
+});
+
+test("renders the compact card with the title, start time, message count, ID, and button only", async (t) => {
+  const f = fixture({ settings: { cardLayout: "compact" } }); t.after(f.cleanup);
+  writeSession(f.home);
+  await f.plugin.onload();
+  const el = fakeEl();
+  f.plugin.processor(ID, el);
+  assert.equal(el.children[0].cls, "pi-session-card pi-session-compact");
+  const start = new Date("2026-01-01T00:00:00Z").toLocaleString();
+  assert.deepEqual(texts(el), ["fix the test", `${start}  ·  2 messages`, ID, "Open in Rex"]);
+});
+
+test("refreshes cards from the command and reads the session file again", async (t) => {
+  const f = fixture({ settings: { cardLayout: "compact" } }); t.after(f.cleanup);
+  writeSession(f.home);
+  await f.plugin.onload();
+  const el = fakeEl();
+  f.plugin.processor(ID, el);
+  const file = path.join(f.home, ".pi", "agent", "sessions", "--home--", `test_${ID}.jsonl`);
+  fs.appendFileSync(file, JSON.stringify({ type: "session_info", name: "renamed" }) + "\n");
+  f.plugin.commands["refresh-pi-session-cards"].callback();
+  assert.equal(texts(el)[0], "renamed");
+  assert.ok(f.notices.includes("Refreshed 1 Pi session card."));
+});
+
+test("re-renders connected cards when the layout changes", async (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  writeSession(f.home);
+  await f.plugin.onload();
+  const live = fakeEl();
+  const gone = fakeEl();
+  f.plugin.processor(ID, live);
+  f.plugin.processor(ID, gone);
+  gone.isConnected = false;
+  f.plugin.settings.cardLayout = "compact";
+  f.plugin.refreshCards();
+  assert.equal(live.children[0].cls, "pi-session-card pi-session-compact");
+  assert.equal(gone.children[0].cls, "pi-session-card");
+  assert.equal(f.plugin.cards.size, 1);
 });
 
 test("migrates the Herdr target and preserves the custom target", async (t) => {
