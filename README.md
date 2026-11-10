@@ -12,6 +12,20 @@ Start and view Pi sessions in Obsidian. Desktop only.
 
 The plugin reads sessions from `~/.pi/agent/sessions/`.
 
+### Pi extension
+
+The Pi extension lets Obsidian find open sessions in Rex. The Rex CLI must be on Pi's `PATH`.
+
+1. Remove any previous installation of `rex-session-label` from Pi's extension paths.
+2. Run these commands from the root of this repository:
+
+   ```sh
+   mkdir -p "$HOME/.pi/agent/extensions"
+   ln -s "$PWD/pi/rex-session-label" "$HOME/.pi/agent/extensions/rex-session-label"
+   ```
+
+3. Start Pi or run `/reload` in an open Pi session.
+
 ## Start a session
 
 1. Select text in a note.
@@ -31,7 +45,11 @@ Click **Open in Rex** to focus or resume a session. To add a card yourself, use 
 ```
 ````
 
-Do not open a Pi session in two processes. The plugin cannot detect sessions outside its Rex tabs. Cards do not update automatically. Run **Pi Session: Refresh Pi session cards** to update them.
+Do not open a Pi session in two processes. The plugin cannot detect sessions outside Rex or sessions without the extension label. It shows a notice if it cannot verify a labeled pane. Rex Remote Control must be on to select a tab in the app.
+
+If Obsidian stops during a request, confirm that no request is active. Then remove the lock file shown in the notice.
+
+Cards do not update automatically. Run **Pi Session: Refresh Pi session cards** to update them.
 
 ## Settings
 
@@ -43,4 +61,4 @@ Custom command arguments must be a JSON array of strings. Use `{sessionFile}`, `
 
 ## Test
 
-Run `node --test test.js`.
+Run the Obsidian plugin tests with `node --test test.js`. Run the Pi extension tests with `bun test pi/rex-session-label/tests`.

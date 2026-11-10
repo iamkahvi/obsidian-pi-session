@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const vm = require("node:vm");
+const crypto = require("node:crypto");
 
 const ID = "12345678-1234-4234-8234-123456789abc";
 const SOURCE = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
@@ -15,7 +16,7 @@ function fakeEl(tag = "div", options = {}) {
     createEl(t, o = {}) { const child = fakeEl(t, o); this.children.push(child); return child; },
     setText(text) { this.text = text; },
     empty() { this.children = []; },
-    addEventListener() {},
+    addEventListener(name, callback) { this[name] = callback; },
   };
 }
 
@@ -41,6 +42,20 @@ function fixture(options = {}) {
   const calls = [];
   const notices = [];
   const sessionDir = path.join(home, ".pi", "agent", "sessions", "--home--");
+  const sessions = [...(options.sessions ?? [{ label: "vault", session_id: "session:vault" }])];
+  const windowsBySession = options.windowsBySession || { "session:vault": [...(options.windows || [])] };
+  const server = "unix:///test/rex.sock";
+  const livePids = new Set(options.livePids || [42]);
+  const createRecord = (sessionId, blockId, id = ID, pid = 42, serverId = server) => {
+    const dir = path.join(home, ".cache", "pi-rex-session-label");
+    fs.mkdirSync(dir, { recursive: true });
+    const key = crypto.createHash("sha256").update(JSON.stringify([serverId, sessionId, blockId])).digest("hex");
+    fs.writeFileSync(path.join(dir, `${key}.json`), JSON.stringify({ version: 1, pid, token: "test-token", previous: "shell", label: `pi:${id}` }));
+  };
+  const blocksFor = (sessionId) => [
+    ...(windowsBySession[sessionId] || []).flatMap((window) => (window.layers || []).flatMap((layer) => layer.blocks || []).map((block) => ({ placement: "placed", host_id: "host:local", window_id: window.window_id, ...block }))),
+    ...((options.detached || {})[sessionId] || []),
+  ];
 
   class Plugin {
     async loadData() { return options.settings || {}; }
@@ -56,11 +71,17 @@ function fixture(options = {}) {
     calls.push({ command, args: Array.from(args) });
     let result = {};
     if (args[0] === "ls") {
-      result = { sessions: options.sessions ?? [{ label: "vault", session_id: "session:vault" }] };
+      result = { sessions };
+    } else if (args[0] === "whoami") {
+      result = { endpoint: server, host_id: "host:local" };
     } else if (args[0] === "window" && args[1] === "ls") {
-      result = { windows: options.windows || [] };
-    } else if (args[0] === "block") {
-      result = { last_exit: options.lastExit ?? null };
+      result = { windows: windowsBySession[args[3]] || [] };
+    } else if (args[0] === "block" && args[1] === "ls") {
+      if (options.onBlockList) options.onBlockList(windowsBySession, args[3]);
+      result = { blocks: blocksFor(args[3]) };
+    } else if (args[0] === "block" && args[1] === "call") {
+      const blockId = args[args.indexOf("-b") + 1];
+      result = options.processByBlock?.[blockId] || { last_exit: options.lastExit ?? null, foreground: { pid: 42, argv0: "pi" } };
     } else if (args[0] === "new" || (args[0] === "window" && args[1] === "new")) {
       if (options.failLaunch) return callback(new Error("launch failed"), "", "launch failed");
       const marker = args.indexOf("--session-id");
@@ -70,25 +91,32 @@ function fixture(options = {}) {
         const entries = options.name ? [{ type: "session_info", name: options.name }, message] : [message];
         fs.writeFileSync(path.join(sessionDir, `test_${ID}.jsonl`), entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
       }
+      const sessionId = args[0] === "new" ? "session:new" : args[3];
+      if (args[0] === "new") sessions.push({ label: "vault", session_id: sessionId });
+      const block = { creator_name: "com.superlogical.terminal", block_id: "block:new", label: options.labelNewBlock === false ? "shell" : `pi:${ID}` };
+      (windowsBySession[sessionId] ||= []).push({ label: `pi:${ID}`, window_id: "window:new", layers: [{ blocks: [block] }] });
+      if (options.labelNewBlock !== false) createRecord(sessionId, "block:new");
       if (options.afterLaunch) options.afterLaunch();
       result = args[0] === "new"
-        ? { session_id: "session:new", initial_windows: [{ window_id: "window:new", block_ids: ["block:new"] }] }
+        ? { session_id: sessionId, initial_windows: [{ window_id: "window:new", block_ids: ["block:new"] }] }
         : { window_id: "window:new", block_ids: ["block:new"] };
     } else if (args[0] === "client") {
       result = { clients: [{ client_id: "client:app", info: { kind: "app" }, connection_state: "connected" }] };
+    } else if (args[0] === "-C" && options.failSelect) {
+      return callback(new Error("Remote Control is off"), "", "Remote Control is off");
     }
     callback(null, JSON.stringify(result), "");
   }
 
   const context = {
     module: { exports: {} },
-    process: { env: { PATH: bin }, platform: "linux" },
+    process: { env: { PATH: bin }, platform: "linux", kill(pid) { if (!livePids.has(pid)) { const error = new Error("no process"); error.code = "ESRCH"; throw error; } } },
     setTimeout: (callback) => setImmediate(callback),
     require(name) {
       if (name === "obsidian") return { Plugin, PluginSettingTab, Setting, Notice };
       if (name === "os") return { homedir: () => home };
       if (name === "child_process") return { execFile };
-      if (name === "crypto") return { randomUUID: () => ID };
+      if (name === "crypto") return { ...crypto, randomUUID: () => ID };
       return require(name);
     },
   };
@@ -104,7 +132,7 @@ function fixture(options = {}) {
     getLine() { return this.text; },
     replaceRange(value, from, to) { this.text = this.text.slice(0, from.ch) + value + this.text.slice(to.ch); },
   };
-  return { home, bin, calls, notices, plugin, editor, helpers: PluginClass.testHelpers,
+  return { home, bin, calls, notices, plugin, editor, createRecord, helpers: PluginClass.testHelpers,
     cleanup: () => fs.rmSync(home, { recursive: true, force: true }) };
 }
 
@@ -163,23 +191,55 @@ test("passes special text as one argument and avoids Pi's @file syntax", async (
   assert.equal(launch.args.at(-1), " @mention\n$(echo unsafe)");
 });
 
-test("focuses a live Pi tab rather than opening a second writer", async (t) => {
-  const windows = [{ label: `pi:${ID}`, window_id: "window:live", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:live" }] }] }];
-  const f = fixture({ windows }); t.after(f.cleanup);
+test("focuses a live Pi pane in another Rex session, even if its cwd is gone", async (t) => {
+  const sessions = [{ label: "other", session_id: "session:other" }];
+  const windowsBySession = { "session:other": [{ label: "original tab", window_id: "window:live", layers: [{ blocks: [
+    { creator_name: "com.superlogical.terminal", block_id: "block:shell", label: "shell" },
+    { creator_name: "com.superlogical.terminal", block_id: "block:live", label: `pi:${ID}` },
+  ] }] }] };
+  const f = fixture({ sessions, windowsBySession, settings: { piExecutable: "/missing/pi" } }); t.after(f.cleanup);
+  f.createRecord("session:other", "block:live");
   await f.plugin.onload();
-  const result = await f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home);
+  const result = await f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, "/missing", "new name");
   assert.equal(result, "Focused the Pi session in Rex.");
-  assert.equal(f.calls.some(({ args }) => args[0] === "window" && args[1] === "new"), false);
-  assert.ok(f.calls.some(({ args }) => args.includes("window_id=window:live")));
+  assert.equal(f.calls.some(({ args }) => args[1] === "new" || args[1] === "rename"), false);
+  assert.ok(f.calls.some(({ args }) => args.join(" ") === "focus -s session:other block:live"));
+  assert.ok(f.calls.some(({ args }) => args.includes("session_id=session:other") && args.includes("window_id=window:live")));
 });
 
-test("names the Rex tab after the Pi session and keeps the ID on the block", async (t) => {
+test("names a new Rex tab only after the extension labels its block", async (t) => {
   const f = fixture({ name: "  -fix   the flaky checkout test in the storefront suite" }); t.after(f.cleanup);
   await f.plugin.onload();
   await f.plugin.startSession(f.editor, { file: {} });
   const rename = (kind) => f.calls.find(({ args }) => args[0] === kind && args[1] === "rename")?.args;
-  assert.deepEqual(rename("block"), ["block", "rename", "-s", "session:vault", "--", "block:new", `pi:${ID}`]);
+  assert.equal(rename("block"), undefined);
   assert.deepEqual(rename("window"), ["window", "rename", "-s", "session:vault", "--", "window:new", "-fix the flaky checkout test in the s..."]);
+});
+
+test("keeps the initial window ID if the extension has not labeled the block", async (t) => {
+  const f = fixture({ name: "A name", labelNewBlock: false }); t.after(f.cleanup);
+  await f.plugin.onload();
+  await f.plugin.startSession(f.editor, { file: {} });
+  assert.equal(f.calls.some(({ args }) => args[1] === "rename"), false);
+});
+
+test("names a new tab when the extension labels the block after startup", async (t) => {
+  let reads = 0;
+  const f = fixture({ name: "A name", labelNewBlock: false, onBlockList(windows, session) {
+    if (++reads === 2) windows[session][0].layers[0].blocks[0].label = `pi:${ID}`;
+  } }); t.after(f.cleanup);
+  await f.plugin.onload();
+  await f.plugin.startSession(f.editor, { file: {} });
+  assert.ok(f.calls.some(({ args }) => args.join(" ") === "window rename -s session:vault -- window:new A name"));
+});
+
+test("does not overwrite a tab name set during startup", async (t) => {
+  const f = fixture({ name: "A name", onBlockList(windows, session) {
+    windows[session][0].label = "user name";
+  } }); t.after(f.cleanup);
+  await f.plugin.onload();
+  await f.plugin.startSession(f.editor, { file: {} });
+  assert.equal(f.calls.some(({ args }) => args[1] === "rename"), false);
 });
 
 test("keeps the ID label when the Pi session has no name", async (t) => {
@@ -189,18 +249,135 @@ test("keeps the ID label when the Pi session has no name", async (t) => {
   assert.equal(f.calls.some(({ args }) => args[1] === "rename"), false);
 });
 
-test("finds a live Pi tab by its block label", async (t) => {
-  const windows = [
-    { label: "other", window_id: "window:other", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:other", label: "shell" }] }] },
-    { label: "readable name", window_id: "window:live", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:live", label: `pi:${ID}` }] }] },
-  ];
+test("focuses the labeled pane when its old window label matches and another pane is a shell", async (t) => {
+  const windows = [{ label: `pi:${ID}`, window_id: "window:live", layers: [{ blocks: [
+    { creator_name: "com.superlogical.terminal", block_id: "block:live", label: `pi:${ID}` },
+    { creator_name: "com.superlogical.terminal", block_id: "block:shell", label: "shell" },
+  ] }] }];
+  const f = fixture({ windows }); t.after(f.cleanup);
+  f.createRecord("session:vault", "block:live");
+  await f.plugin.onload();
+  assert.equal(await f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home), "Focused the Pi session in Rex.");
+  assert.ok(f.calls.some(({ args }) => args.join(" ") === "focus -s session:vault block:live"));
+});
+
+test("refuses an unverified labeled shell rather than opening a second writer", async (t) => {
+  const windows = [{ label: "tab", window_id: "window:live", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:live", label: `pi:${ID}` }] }] }];
   const f = fixture({ windows }); t.after(f.cleanup);
   await f.plugin.onload();
-  const result = await f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home, "new name");
-  assert.equal(result, "Focused the Pi session in Rex.");
-  assert.equal(f.calls.some(({ args }) => args[0] === "window" && args[1] === "new"), false);
-  assert.ok(f.calls.some(({ args }) => args.join(" ") === "window rename -s session:vault -- window:live new name"));
-  assert.ok(f.calls.some(({ args }) => args.includes("window_id=window:live")));
+  await assert.rejects(f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home), /Cannot verify/);
+  assert.equal(f.calls.some(({ args }) => args[1] === "new"), false);
+});
+
+test("reopens a session when the local record's Pi process no longer exists", async (t) => {
+  const windows = [{ label: "tab", window_id: "window:old", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:old", label: `pi:${ID}` }] }] }];
+  const f = fixture({ windows, livePids: [], processByBlock: { "block:old": { last_exit: null, foreground: { pid: 50, argv0: "zsh" } } } }); t.after(f.cleanup);
+  f.createRecord("session:vault", "block:old");
+  await f.plugin.onload();
+  assert.equal(await f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home), "Opened the Pi session in Rex.");
+  assert.ok(f.calls.some(({ args }) => args.includes("--session") && args.includes("/session.jsonl")));
+});
+
+test("refuses a live journal PID that Rex cannot associate with the pane", async (t) => {
+  const windows = [{ label: "tab", window_id: "window:old", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:old", label: `pi:${ID}` }] }] }];
+  const f = fixture({ windows, processByBlock: { "block:old": { last_exit: null, foreground: { pid: 50, argv0: "zsh" } } } }); t.after(f.cleanup);
+  f.createRecord("session:vault", "block:old");
+  await f.plugin.onload();
+  await assert.rejects(f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home), /Cannot verify/);
+  assert.equal(f.calls.some(({ args }) => args[1] === "new"), false);
+});
+
+test("accepts Pi as an ancestor of the foreground process", async (t) => {
+  const windows = [{ label: "tab", window_id: "window:live", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:live", label: `pi:${ID}` }] }] }];
+  const f = fixture({ windows, processByBlock: { "block:live": { last_exit: null, foreground: { pid: 50, argv0: "bash" }, ancestors: [{ pid: 42, argv0: "pi" }] } } }); t.after(f.cleanup);
+  f.createRecord("session:vault", "block:live");
+  await f.plugin.onload();
+  assert.equal(await f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home), "Focused the Pi session in Rex.");
+});
+
+test("does not use local PID checks for a remote pane", async (t) => {
+  const windows = [{ label: "tab", window_id: "window:old", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:old", label: `pi:${ID}`, host_id: "host:remote" }] }] }];
+  const f = fixture({ windows, livePids: [], processByBlock: { "block:old": { last_exit: null, foreground: { pid: 50, argv0: "zsh" } } } }); t.after(f.cleanup);
+  f.createRecord("session:vault", "block:old");
+  await f.plugin.onload();
+  await assert.rejects(f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home), /Cannot verify/);
+  assert.equal(f.calls.some(({ args }) => args[1] === "new"), false);
+});
+
+test("refuses a legacy tab whose process may still be Pi", async (t) => {
+  const windows = [{ label: `pi:${ID}`, window_id: "window:old", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:old", label: "shell" }] }] }];
+  const f = fixture({ windows }); t.after(f.cleanup);
+  await f.plugin.onload();
+  await assert.rejects(f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home), /may already contain/);
+  assert.equal(f.calls.some(({ args }) => args[1] === "new"), false);
+});
+
+test("refuses duplicate labels across Rex sessions", async (t) => {
+  const pane = (id) => [{ label: "tab", window_id: `window:${id}`, layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: `block:${id}`, label: `pi:${ID}` }] }] }];
+  const f = fixture({ sessions: [{ label: "a", session_id: "session:a" }, { label: "b", session_id: "session:b" }], windowsBySession: { "session:a": pane("a"), "session:b": pane("b") } }); t.after(f.cleanup);
+  await f.plugin.onload();
+  await assert.rejects(f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home), /More than one Rex pane/);
+  assert.equal(f.calls.some(({ args }) => args[1] === "new"), false);
+});
+
+test("does not focus a pane after Pi switches to another session", async (t) => {
+  const windows = [{ label: `pi:${ID}`, window_id: "window:old", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:old", label: "pi:other" }] }] }];
+  const f = fixture({ windows }); t.after(f.cleanup);
+  await f.plugin.onload();
+  assert.equal(await f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home), "Opened the Pi session in Rex.");
+  assert.equal(f.calls.some(({ args }) => args[0] === "focus" && args.includes("block:old")), false);
+});
+
+test("refuses a detached Pi pane", async (t) => {
+  const f = fixture({ detached: { "session:vault": [{ creator_name: "com.superlogical.terminal", block_id: "block:detached", label: `pi:${ID}`, placement: "detached", host_id: "host:local" }] } }); t.after(f.cleanup);
+  f.createRecord("session:vault", "block:detached");
+  await f.plugin.onload();
+  await assert.rejects(f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home), /detached/);
+});
+
+test("coalesces concurrent opens for the same Pi session", async (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  await f.plugin.onload();
+  const results = await Promise.all([f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home), f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home)]);
+  assert.deepEqual(results, ["Opened the Pi session in Rex.", "Opened the Pi session in Rex."]);
+  assert.equal(f.calls.filter(({ args }) => args[0] === "window" && args[1] === "new").length, 1);
+});
+
+test("refuses a shared lock from another Obsidian instance", async (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  const dir = path.join(f.home, ".cache", "obsidian-pi-session", "open-locks");
+  fs.mkdirSync(dir, { recursive: true });
+  const key = crypto.createHash("sha256").update(`session:${ID}`).digest("hex");
+  const lock = path.join(dir, `${key}.lock`);
+  fs.writeFileSync(lock, JSON.stringify({ token: "other" }));
+  await f.plugin.onload();
+  await assert.rejects(f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home), /Another open request/);
+  assert.ok(fs.existsSync(lock));
+  assert.equal(f.calls.some(({ args }) => args[1] === "new"), false);
+});
+
+test("releases the shared lock when Rex cannot select the tab", async (t) => {
+  const windows = [{ label: "tab", window_id: "window:live", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:live", label: `pi:${ID}` }] }] }];
+  const f = fixture({ windows, failSelect: true }); t.after(f.cleanup);
+  f.createRecord("session:vault", "block:live");
+  await f.plugin.onload();
+  await assert.rejects(f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home), /Remote Control/);
+  assert.deepEqual(fs.readdirSync(path.join(f.home, ".cache", "obsidian-pi-session", "open-locks")), []);
+  assert.equal(f.calls.some(({ args }) => args[1] === "new"), false);
+});
+
+test("the card button focuses the labeled pane", async (t) => {
+  const windows = [{ label: "tab", window_id: "window:live", layers: [{ blocks: [{ creator_name: "com.superlogical.terminal", block_id: "block:live", label: `pi:${ID}` }] }] }];
+  const f = fixture({ windows }); t.after(f.cleanup);
+  f.createRecord("session:vault", "block:live");
+  writeSession(f.home);
+  await f.plugin.onload();
+  const el = fakeEl();
+  f.plugin.processor(ID, el);
+  const button = el.children[0].children.at(-1).children.find((child) => child.tag === "button");
+  await button.click();
+  assert.ok(f.calls.some(({ args }) => args.join(" ") === "focus -s session:vault block:live"));
+  assert.ok(f.notices.includes("Focused the Pi session in Rex."));
 });
 
 test("reopens a Pi tab after its process exits", async (t) => {

@@ -3,7 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { execFile } = require("child_process");
-const { randomUUID } = require("crypto");
+const { createHash, randomUUID } = require("crypto");
 
 const HOME = os.homedir();
 const SESSIONS_DIR = path.join(HOME, ".pi", "agent", "sessions");
@@ -100,19 +100,24 @@ async function findVaultSession(rex) {
   return matches[0] || null;
 }
 
-async function showInRex(rex, sessionId, windowId) {
+async function showInRex(rex, sessionId, windowId, blockId) {
+  if (blockId) await run(rex, ["focus", "-s", sessionId, blockId]);
   if (process.platform === "darwin") await run("/usr/bin/open", ["-b", REX_APP_BUNDLE]);
   for (let i = 0; i < 50; i++) {
     const { clients } = await rexJson(rex, ["client", "ls", "--json"]);
     const apps = (clients || []).filter((client) => client.info?.kind === "app" && client.connection_state === "connected");
-    if (apps.length > 1) throw new Error("More than one Rex app is connected. Select the vault session in Rex.");
+    if (apps.length > 1) throw new Error("More than one Rex app is connected. Select the session in Rex.");
     if (apps.length === 1) {
-      await run(rex, ["-C", apps[0].client_id, "do", "session.select", `session_id=${sessionId}`, `window_id=${windowId}`]);
+      try {
+        await run(rex, ["-C", apps[0].client_id, "do", "session.select", `session_id=${sessionId}`, `window_id=${windowId}`]);
+      } catch (error) {
+        throw new Error(`Could not select the Rex tab. Check Rex Remote Control. ${error.message}`);
+      }
       return;
     }
     await sleep(200);
   }
-  throw new Error("Rex app did not connect. Select the vault session in Rex.");
+  throw new Error("Rex app did not connect. Select the session in Rex.");
 }
 
 const piLabel = (id) => `pi:${id}`;
@@ -122,13 +127,24 @@ function tabLabel(name) {
   return clean.length > MAX_TAB_CHARS ? `${clean.slice(0, MAX_TAB_CHARS - 3)}...` : clean;
 }
 
-// The block label keeps the session ID, so the window label can show the Pi session name.
+// Keep the initial window ID label until the Pi extension labels the block.
 async function nameRexWindow(rex, target, name) {
   const label = tabLabel(name);
   if (!label || !target.blockId) return;
   try {
-    await run(rex, ["block", "rename", "-s", target.sessionId, "--", target.blockId, piLabel(target.id)]);
-    await run(rex, ["window", "rename", "-s", target.sessionId, "--", target.windowId, label]);
+    for (let i = 0; i < 10; i++) {
+      const { blocks } = await rexJson(rex, ["block", "ls", "-s", target.sessionId, "--json"]);
+      const block = (blocks || []).find((item) => item.block_id === target.blockId);
+      if (!block || (block.label?.startsWith("pi:") && block.label !== piLabel(target.id))) return;
+      if (block.label === piLabel(target.id)) {
+        const { windows } = await rexJson(rex, ["window", "ls", "-s", target.sessionId, "--json"]);
+        if ((windows || []).some((item) => item.window_id === target.windowId && item.label === piLabel(target.id))) {
+          await run(rex, ["window", "rename", "-s", target.sessionId, "--", target.windowId, label]);
+        }
+        return;
+      }
+      if (i < 9) await sleep(200);
+    }
   } catch (error) {
     new Notice(`Pi Session: Could not name the Rex tab. ${error.message}`, 8000);
   }
@@ -138,47 +154,142 @@ let rexWindowQueue = Promise.resolve();
 
 function createRexWindow(settings, rex, id, cwd, piArgs) {
   const create = async () => {
-    const session = await findVaultSession(rex);
-    const label = piLabel(id);
-    const piCommand = [findPiExecutable(settings.piExecutable), ...piArgs];
-    if (session) {
-      const result = await rexJson(rex, ["window", "new", "-s", session.session_id, label, "-c", cwd, "--json", "--", ...piCommand]);
-      return { id, sessionId: session.session_id, windowId: result.window_id, blockId: result.block_ids?.[0] };
+    const release = acquireOpenLock("vault-creation");
+    try {
+      const session = await findVaultSession(rex);
+      const label = piLabel(id);
+      const piCommand = [findPiExecutable(settings.piExecutable), ...piArgs];
+      if (session) {
+        const result = await rexJson(rex, ["window", "new", "-s", session.session_id, label, "-c", cwd, "--json", "--", ...piCommand]);
+        return { id, sessionId: session.session_id, windowId: result.window_id, blockId: result.block_ids?.[0] };
+      }
+      const result = await rexJson(rex, ["new", REX_SESSION, "-c", cwd, "--window", label, "--json", "--", ...piCommand]);
+      const window = result.initial_windows[0];
+      return { id, sessionId: result.session_id, windowId: window.window_id, blockId: window.block_ids?.[0] };
+    } finally {
+      release();
     }
-    const result = await rexJson(rex, ["new", REX_SESSION, "-c", cwd, "--window", label, "--json", "--", ...piCommand]);
-    const window = result.initial_windows[0];
-    return { id, sessionId: result.session_id, windowId: window.window_id, blockId: window.block_ids?.[0] };
   };
   const result = rexWindowQueue.then(create);
   rexWindowQueue = result.catch(() => {});
   return result;
 }
 
-async function findRexWindow(rex, session, id) {
-  const result = await rexJson(rex, ["window", "ls", "-s", session.session_id, "--json"]);
-  for (const window of result.windows || []) {
-    const blocks = (window.layers || []).flatMap((layer) => layer.blocks || [])
-      .filter((block) => block.creator_name === "com.superlogical.terminal");
-    const labeled = blocks.filter((block) => block.label === piLabel(id));
-    // Older versions put the session ID on the window label.
-    const candidates = labeled.length ? labeled : window.label === piLabel(id) ? blocks : [];
-    for (const block of candidates) {
-      const processInfo = await rexJson(rex, ["block", "call", "-s", session.session_id, "-b", block.block_id, "process"]);
-      if (processInfo.last_exit === null) return { id, sessionId: session.session_id, windowId: window.window_id, blockId: block.block_id };
+// The Pi extension owns this record. It associates a block label with the Pi PID.
+function rexLabelRecord(server, sessionId, blockId, label) {
+  const cache = process.env.XDG_CACHE_HOME || path.join(HOME, ".cache");
+  const key = createHash("sha256").update(JSON.stringify([server, sessionId, blockId])).digest("hex");
+  try {
+    const record = JSON.parse(fs.readFileSync(path.join(cache, "pi-rex-session-label", `${key}.json`), "utf8"));
+    if (record.version !== 1 || !Number.isSafeInteger(record.pid) || record.pid <= 0 || record.label !== label || typeof record.token !== "string") return null;
+    return record;
+  } catch {
+    return null;
+  }
+}
+
+async function findRexWindow(rex, id) {
+  const { sessions } = await rexJson(rex, ["ls", "--json"]);
+  if (!Array.isArray(sessions)) throw new Error("Could not list Rex sessions.");
+  const matches = [];
+  const legacy = [];
+  for (const session of sessions) {
+    const { blocks } = await rexJson(rex, ["block", "ls", "-s", session.session_id, "--json"]);
+    const { windows } = await rexJson(rex, ["window", "ls", "-s", session.session_id, "--json"]);
+    if (!Array.isArray(blocks) || !Array.isArray(windows)) throw new Error("Could not list Rex panes.");
+    for (const block of blocks) {
+      if (block.creator_name === "com.superlogical.terminal" && block.label === piLabel(id)) {
+        matches.push({ id, sessionId: session.session_id, windowId: block.window_id, blockId: block.block_id, block });
+      }
+    }
+    // Old plugin tabs and tabs whose Pi extension has not started yet.
+    for (const window of windows.filter((item) => item.label === piLabel(id))) {
+      if (blocks.some((item) => item.window_id === window.window_id && item.label === piLabel(id))) continue;
+      for (const block of blocks.filter((item) => item.window_id === window.window_id && item.creator_name === "com.superlogical.terminal" && !item.label?.startsWith("pi:"))) {
+        legacy.push({ sessionId: session.session_id, blockId: block.block_id });
+      }
     }
   }
-  return null;
+  if (matches.length > 1) throw new Error("More than one Rex pane has this Pi session ID. Check Rex before retry.");
+  for (const candidate of legacy) {
+    const info = await rexJson(rex, ["block", "call", "-s", candidate.sessionId, "-b", candidate.blockId, "process"]);
+    if (info.last_exit === null || info.last_exit === undefined) throw new Error("A Rex tab may already contain this Pi session. Check Rex before retry.");
+  }
+  if (!matches.length) return null;
+
+  const target = matches[0];
+  const info = await rexJson(rex, ["block", "call", "-s", target.sessionId, "-b", target.blockId, "process"]);
+  if (info.last_exit !== null && info.last_exit !== undefined) return null;
+  const who = await rexJson(rex, ["whoami", "--json"]);
+  const servers = [...new Set([process.env.REX_SERVER, who.endpoint, "default"].filter(Boolean))];
+  const records = servers.map((server) => rexLabelRecord(server, target.sessionId, target.blockId, piLabel(id))).filter(Boolean);
+  if (records.length !== 1) throw new Error("Cannot verify the Pi session in Rex. Check Rex before retry.");
+  const record = records[0];
+  const processes = [info.child, info.foreground, ...(info.ancestors || [])].filter(Boolean);
+  const piProcess = processes.find((item) => item.pid === record.pid && (item.argv0 === "pi" || path.basename(item.script || "") === "pi"));
+  if (piProcess && info.last_exit === null) {
+    if (target.block.placement !== "placed" || !target.windowId) throw new Error("The Pi session is in a detached Rex pane. Attach it before retry.");
+    return target;
+  }
+  // A local Unix server and a matching host ID make the journal PID local.
+  if (who.endpoint?.startsWith("unix:") && who.host_id && target.block.host_id === who.host_id) {
+    try { process.kill(record.pid, 0); }
+    catch (error) { if (error.code === "ESRCH") return null; }
+  }
+  throw new Error("Cannot verify the Pi session in Rex. Check Rex before retry.");
+}
+
+const pendingRexOpens = new Map();
+
+function acquireOpenLock(id) {
+  const dir = path.join(HOME, ".cache", "obsidian-pi-session", "open-locks");
+  const key = createHash("sha256").update(id).digest("hex");
+  const file = path.join(dir, `${key}.lock`);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  let fd;
+  try {
+    fd = fs.openSync(file, "wx", 0o600);
+  } catch (error) {
+    if (error.code === "EEXIST") throw new Error(`Another open request may be active. If it stopped, remove ${file} before retry.`);
+    throw error;
+  }
+  const token = randomUUID();
+  try {
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, token }));
+    fs.closeSync(fd);
+  } catch (error) {
+    try { fs.closeSync(fd); } catch {}
+    try { fs.unlinkSync(file); } catch {}
+    throw error;
+  }
+  return () => {
+    try {
+      if (JSON.parse(fs.readFileSync(file, "utf8")).token === token) fs.unlinkSync(file);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  };
 }
 
 async function openInRex(settings, file, id, cwd, name) {
-  if (!cwd || !fs.existsSync(cwd)) throw new Error(`cwd does not exist: ${cwd}`);
-  const rex = findRexExecutable();
-  const session = await findVaultSession(rex);
-  const liveWindow = session && await findRexWindow(rex, session, id);
-  const target = liveWindow || await createRexWindow(settings, rex, id, cwd, ["--session", file]);
-  await nameRexWindow(rex, target, name);
-  await showInRex(rex, target.sessionId, target.windowId);
-  return liveWindow ? "Focused the Pi session in Rex." : "Opened the Pi session in Rex.";
+  if (pendingRexOpens.has(id)) return pendingRexOpens.get(id);
+  const open = (async () => {
+    const release = acquireOpenLock(`session:${id}`);
+    try {
+      const rex = findRexExecutable();
+      const liveWindow = await findRexWindow(rex, id);
+      if (!liveWindow && (!cwd || !fs.existsSync(cwd))) throw new Error(`cwd does not exist: ${cwd}`);
+      const target = liveWindow || await createRexWindow(settings, rex, id, cwd, ["--session", file]);
+      if (!liveWindow) await nameRexWindow(rex, target, name);
+      await showInRex(rex, target.sessionId, target.windowId, target.blockId);
+      return liveWindow ? "Focused the Pi session in Rex." : "Opened the Pi session in Rex.";
+    } finally {
+      release();
+    }
+  })();
+  pendingRexOpens.set(id, open);
+  try { return await open; }
+  finally { pendingRexOpens.delete(id); }
 }
 
 function openButtonLabel(settings) {
@@ -482,7 +593,7 @@ module.exports = class PiSessionPlugin extends Plugin {
       const argument = prompt.startsWith("@") ? ` ${prompt}` : prompt;
       attempted = true;
       const target = await createRexWindow(this.settings, rex, id, HOME, ["--session-id", id, "--", argument]);
-      showInRex(rex, target.sessionId, target.windowId).catch((error) => new Notice(`Pi Session: ${error.message}`, 8000));
+      showInRex(rex, target.sessionId, target.windowId, target.blockId).catch((error) => new Notice(`Pi Session: ${error.message}`, 8000));
       let sessionFile;
       for (let i = 0; i < 300; i++) {
         sessionFile = findSessionFile(id);
