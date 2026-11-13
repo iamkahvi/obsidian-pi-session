@@ -9,6 +9,7 @@ const HOME = os.homedir();
 const SESSIONS_DIR = path.join(HOME, ".pi", "agent", "sessions");
 const MAX_CHARS = 300;
 const MAX_TAB_CHARS = 40;
+const NAME_WAIT_POLLS = 50; // 10 seconds at 200 ms
 const DEFAULT_SETTINGS = {
   cardLayout: "default",
   openEnabled: true,
@@ -127,10 +128,36 @@ function tabLabel(name) {
   return clean.length > MAX_TAB_CHARS ? `${clean.slice(0, MAX_TAB_CHARS - 3)}...` : clean;
 }
 
+// Rex gives new tabs names such as "Window 635b87d7".
+const DEFAULT_TAB_NAME = /^Window [0-9a-f]{8}$/;
+
+// Map each Pi session ID to the name of its Rex tab. Skip default names and tabs with more than one Pi pane.
+async function listRexTabNames(rex) {
+  const { sessions } = await rexJson(rex, ["ls", "--json"]);
+  if (!Array.isArray(sessions)) throw new Error("Could not list Rex sessions.");
+  const names = new Map();
+  await Promise.all(sessions.map(async (session) => {
+    const [{ windows }, { blocks }] = await Promise.all([
+      rexJson(rex, ["window", "ls", "-s", session.session_id, "--json"]),
+      rexJson(rex, ["block", "ls", "-s", session.session_id, "--json"]),
+    ]);
+    for (const window of windows || []) {
+      const label = (window.label || "").trim();
+      if (!label || label.startsWith("pi:") || DEFAULT_TAB_NAME.test(label)) continue;
+      const ids = (blocks || [])
+        .filter((block) => block.window_id === window.window_id && block.creator_name === "com.superlogical.terminal" && block.label?.startsWith("pi:"))
+        .map((block) => block.label.slice(3));
+      if (ids.length === 1) names.set(ids[0], label);
+    }
+  }));
+  return names;
+}
+
 // Keep the initial window ID label until the Pi extension labels the block.
+// Return the tab name when the rename succeeds.
 async function nameRexWindow(rex, target, name) {
   const label = tabLabel(name);
-  if (!label || !target.blockId) return;
+  if (!label || !target.blockId) return null;
   try {
     for (let i = 0; i < 10; i++) {
       const { blocks } = await rexJson(rex, ["block", "ls", "-s", target.sessionId, "--json"]);
@@ -140,8 +167,9 @@ async function nameRexWindow(rex, target, name) {
         const { windows } = await rexJson(rex, ["window", "ls", "-s", target.sessionId, "--json"]);
         if ((windows || []).some((item) => item.window_id === target.windowId && item.label === piLabel(target.id))) {
           await run(rex, ["window", "rename", "-s", target.sessionId, "--", target.windowId, label]);
+          return label;
         }
-        return;
+        return null;
       }
       if (i < 9) await sleep(200);
     }
@@ -271,7 +299,7 @@ function acquireOpenLock(id) {
   };
 }
 
-async function openInRex(settings, file, id, cwd, name) {
+async function openInRex(settings, file, id, cwd, name, onTabName) {
   if (pendingRexOpens.has(id)) return pendingRexOpens.get(id);
   const open = (async () => {
     const release = acquireOpenLock(`session:${id}`);
@@ -280,7 +308,10 @@ async function openInRex(settings, file, id, cwd, name) {
       const liveWindow = await findRexWindow(rex, id);
       if (!liveWindow && (!cwd || !fs.existsSync(cwd))) throw new Error(`cwd does not exist: ${cwd}`);
       const target = liveWindow || await createRexWindow(settings, rex, id, cwd, ["--session", file]);
-      if (!liveWindow) await nameRexWindow(rex, target, name);
+      if (!liveWindow) {
+        const label = await nameRexWindow(rex, target, name);
+        if (label && onTabName) await onTabName(label);
+      }
       await showInRex(rex, target.sessionId, target.windowId, target.blockId);
       return liveWindow ? "Focused the Pi session in Rex." : "Opened the Pi session in Rex.";
     } finally {
@@ -331,6 +362,18 @@ function findSessionFile(id) {
     if (hit) return path.join(full, hit);
   }
   return null;
+}
+
+// A block holds "id:" and "title:" lines in any order. A bare line is the ID, for old blocks.
+function parseBlock(source) {
+  const keys = {};
+  let bare = "";
+  for (const line of source.split("\n").map((item) => item.trim()).filter(Boolean)) {
+    const match = line.match(/^([a-z]+)\s*:\s*(.*)$/i);
+    if (match) keys[match[1].toLowerCase()] = match[2].trim();
+    else if (!bare) bare = line;
+  }
+  return { id: keys.id || bare, title: keys.title || "" };
 }
 
 function textOf(content) {
@@ -396,7 +439,7 @@ class PiSessionSettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Card layout")
-      .setDesc("Compact shows only the title, start time, message count, session ID, and button.")
+      .setDesc("Compact shows only the title, first prompt, start time, message count, session ID, and button.")
       .addDropdown((dropdown) => dropdown
         .addOption("default", "Default")
         .addOption("compact", "Compact")
@@ -473,6 +516,7 @@ class PiSessionSettingsTab extends PluginSettingTab {
 module.exports = class PiSessionPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings.tabNames = { ...this.settings.tabNames };
     this.openingSessions = new Set();
     if (this.settings.openTarget === "herdr-app") this.settings.openTarget = "rex";
     this.addSettingTab(new PiSessionSettingsTab(this.app, this));
@@ -487,16 +531,13 @@ module.exports = class PiSessionPlugin extends Plugin {
     });
     this.addCommand({
       id: "refresh-pi-session-cards",
-      name: "Refresh Pi session cards",
-      callback: () => {
-        const count = this.refreshCards();
-        new Notice(`Refreshed ${count} Pi session card${count === 1 ? "" : "s"}.`);
-      },
+      name: "Refresh Pi session cards and titles",
+      callback: () => this.refreshFromRex(),
     });
 
     this.cards = new Set();
     this.registerMarkdownCodeBlockProcessor("pi-session", (source, el) => {
-      const card = { el, id: source.trim() };
+      const card = { el, ...parseBlock(source) };
       this.cards.add(card);
       this.renderCard(card);
     });
@@ -514,7 +555,7 @@ module.exports = class PiSessionPlugin extends Plugin {
     return this.cards.size;
   }
 
-  renderCard({ el, id }) {
+  renderCard({ el, id, title }) {
     const compact = this.settings.cardLayout === "compact";
     const card = el.createDiv({ cls: compact ? "pi-session-card pi-session-compact" : "pi-session-card" });
     const file = id && findSessionFile(id);
@@ -523,8 +564,10 @@ module.exports = class PiSessionPlugin extends Plugin {
       return;
     }
     const s = parseSession(file);
-    card.createDiv({ cls: "pi-session-title", text: s.name || "(no name)" });
+    card.createDiv({ cls: "pi-session-title", text: title || this.cardTitle(id, s) || "(no name)" });
     if (compact) {
+      const prompt = s.firstUser.trim();
+      if (prompt) card.createDiv({ cls: "pi-session-prompt", text: cut(prompt), attr: { title: prompt } });
       const messages = s.users + s.assistants;
       card.createDiv({
         cls: "pi-session-meta",
@@ -559,7 +602,7 @@ module.exports = class PiSessionPlugin extends Plugin {
       try {
         const result = this.settings.openTarget === "custom-command"
           ? await openWithCustomCommand(this.settings, file, id, s.cwd)
-          : await openInRex(this.settings, file, id, s.cwd, parseSession(file).name);
+          : await openInRex(this.settings, file, id, s.cwd, title || this.cardTitle(id, parseSession(file)), (label) => this.saveTabName(id, label));
         new Notice(result);
       } catch (e) {
         new Notice(`Pi Session: ${e.message}`, 8000);
@@ -602,7 +645,13 @@ module.exports = class PiSessionPlugin extends Plugin {
         await sleep(200);
       }
       if (!sessionFile) throw new Error(`Pi did not save the prompt. Session ID: ${id}`);
-      await nameRexWindow(rex, target, parseSession(sessionFile).name);
+      let name = parseSession(sessionFile).name;
+      for (let i = 0; !name && i < NAME_WAIT_POLLS; i++) {
+        await sleep(200);
+        name = parseSession(sessionFile).name;
+      }
+      const label = await nameRexWindow(rex, target, name);
+      if (label) await this.saveTabName(id, label);
       if (view.file !== file || editor.getValue() !== original) {
         throw new Error(`The note changed. The selection was not replaced. Session ID: ${id}`);
       }
@@ -617,6 +666,36 @@ module.exports = class PiSessionPlugin extends Plugin {
     } finally {
       this.launching = false;
     }
+  }
+
+  // The Rex tab name wins over the Pi session name. The plugin keeps it after the tab closes.
+  cardTitle(id, session) {
+    return this.settings.tabNames[id] || session.name;
+  }
+
+  async saveTabName(id, label) {
+    if (this.settings.tabNames[id] === label) return;
+    this.settings.tabNames[id] = label;
+    await this.saveSettings();
+  }
+
+  async refreshFromRex() {
+    let message;
+    try {
+      const names = await listRexTabNames(findRexExecutable());
+      let changed = 0;
+      for (const [id, label] of names) {
+        if (this.settings.tabNames[id] === label) continue;
+        this.settings.tabNames[id] = label;
+        changed++;
+      }
+      if (changed) await this.saveSettings();
+      message = `Updated ${changed} title${changed === 1 ? "" : "s"} from Rex.`;
+    } catch (error) {
+      message = `Could not read Rex tab names. ${error.message}`;
+    }
+    const count = this.refreshCards();
+    new Notice(`Refreshed ${count} Pi session card${count === 1 ? "" : "s"}. ${message}`);
   }
 
   async saveSettings() {

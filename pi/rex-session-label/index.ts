@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard } from "@earendil-works/pi-coding-agent";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -139,10 +140,33 @@ export function createController(options: {
   };
 }
 
+// Build a pi-session block for the Obsidian plugin. Omit the title line when there is no title.
+export function sessionBlock(id: string, title?: string): string {
+  const clean = (title ?? "").replace(/\s+/g, " ").trim();
+  return ["```pi-session", `id: ${id}`, ...(clean ? [`title: ${clean}`] : []), "```"].join("\n");
+}
+
 export default function (pi: ExtensionAPI) {
   // The package and the install link can discover the same extension twice.
   if (shared.registered) return;
   shared.registered = true;
+
+  pi.registerCommand("copy-obsidian-block", {
+    description: "Copy a pi-session block for Obsidian. Optional argument: the card title.",
+    handler: async (args, ctx) => {
+      if (!ctx.sessionManager.getSessionFile()) {
+        ctx.ui.notify("This session is not saved. Obsidian cannot show it.", "error");
+        return;
+      }
+      const block = sessionBlock(ctx.sessionManager.getSessionId(), args.trim() || pi.getSessionName());
+      try {
+        await copyToClipboard(block);
+        ctx.ui.notify("Copied the pi-session block.", "info");
+      } catch (error) {
+        ctx.ui.notify(`Copy failed: ${(error as Error).message}`, "error");
+      }
+    },
+  });
   let controller: ReturnType<typeof createController> | undefined;
   let scope: Omit<NonNullable<Shared["pending"]>, "record"> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;

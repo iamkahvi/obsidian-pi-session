@@ -1,8 +1,16 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import extension, { createController } from "../index";
+const clipboard = { copied: [] as string[], fail: false };
+mock.module("@earendil-works/pi-coding-agent", () => ({
+  copyToClipboard: async (text: string) => {
+    if (clipboard.fail) throw new Error("no clipboard");
+    clipboard.copied.push(text);
+  },
+}));
+// Import after the mock. Bun cannot resolve the Pi package outside Pi.
+const { default: extension, createController, sessionBlock } = await import("../index");
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -177,6 +185,7 @@ async function eventFixture() {
     const handlers: Record<string, any> = {};
     extension({
       on: (name: string, handler: any) => { handlers[name] = handler; },
+      registerCommand: () => {},
       exec: async (_name: string, args: string[]) => {
         if (args.includes("session.list_blocks")) {
           if (state.failRead) throw new Error("offline");
@@ -210,7 +219,8 @@ async function waitUntil(check: () => boolean | Promise<boolean>) {
 describe("Pi extension", () => {
   test("does nothing outside a Rex TUI and avoids duplicate registration", async () => {
     const handlers: Record<string, any> = {};
-    const api = { on: (name: string, handler: any) => { handlers[name] = handler; }, exec: () => { throw new Error("unexpected"); } };
+    const api = { on: (name: string, handler: any) => { handlers[name] = handler; },
+      registerCommand: () => {}, exec: () => { throw new Error("unexpected"); } };
     extension(api as any);
     let calls = 0;
     extension({ on: () => { calls++; } } as any);
@@ -387,6 +397,7 @@ describe("Pi extension", () => {
         const handlers: Record<string, any> = {};
         extension({
           on: (name: string, handler: any) => { handlers[name] = handler; },
+      registerCommand: () => {},
           exec: async (_name: string, args: string[]) => {
             if (args.includes("session.list_blocks")) {
               return { code: 0, stdout: JSON.stringify({ blocks: [{ block_id: "block:test", label }] }) };
@@ -413,5 +424,65 @@ describe("Pi extension", () => {
         else process.env[key] = saved[key];
       }
     }
+  });
+});
+
+describe("Obsidian block command", () => {
+  test("formats the block with and without a title", () => {
+    expect(sessionBlock("abc", "  Fix\n the   test ")).toBe("```pi-session\nid: abc\ntitle: Fix the test\n```");
+    expect(sessionBlock("abc")).toBe("```pi-session\nid: abc\n```");
+    expect(sessionBlock("abc", "  ")).toBe("```pi-session\nid: abc\n```");
+  });
+
+  async function command(name: string | undefined, file: string | null = "/tmp/session.jsonl") {
+    const commands: Record<string, any> = {};
+    const handlers: Record<string, any> = {};
+    extension({
+      on: (event: string, handler: any) => { handlers[event] = handler; },
+      registerCommand: (id: string, options: any) => { commands[id] = options; },
+      getSessionName: () => name,
+    } as any);
+    await handlers.session_shutdown({ reason: "quit" });
+    const notices: [string, string][] = [];
+    const ctx = {
+      sessionManager: { getSessionId: () => "abc", getSessionFile: () => file },
+      ui: { notify: (text: string, level: string) => notices.push([text, level]) },
+    };
+    return { run: (args: string) => commands["copy-obsidian-block"].handler(args, ctx), notices };
+  }
+
+  test("copies the block with the session name or the argument as the title", async () => {
+    clipboard.copied = [];
+    const { run, notices } = await command("Session name");
+    await run("");
+    await run("  exploration ");
+    expect(clipboard.copied).toEqual([
+      "```pi-session\nid: abc\ntitle: Session name\n```",
+      "```pi-session\nid: abc\ntitle: exploration\n```",
+    ]);
+    expect(notices[0]).toEqual(["Copied the pi-session block.", "info"]);
+  });
+
+  test("copies the block without a title when the session has no name", async () => {
+    clipboard.copied = [];
+    const { run } = await command(undefined);
+    await run("");
+    expect(clipboard.copied).toEqual(["```pi-session\nid: abc\n```"]);
+  });
+
+  test("reports unsaved sessions and clipboard errors", async () => {
+    clipboard.copied = [];
+    const unsaved = await command("name", null);
+    await unsaved.run("");
+    expect(unsaved.notices).toEqual([["This session is not saved. Obsidian cannot show it.", "error"]]);
+    clipboard.fail = true;
+    try {
+      const saved = await command("name");
+      await saved.run("");
+      expect(saved.notices).toEqual([["Copy failed: no clipboard", "error"]]);
+    } finally {
+      clipboard.fail = false;
+    }
+    expect(clipboard.copied).toEqual([]);
   });
 });

@@ -11,7 +11,7 @@ const SOURCE = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
 
 function fakeEl(tag = "div", options = {}) {
   return {
-    tag, cls: options.cls || "", text: options.text || "", children: [], isConnected: true,
+    tag, cls: options.cls || "", text: options.text || "", attr: options.attr || {}, children: [], isConnected: true,
     createDiv(o) { return this.createEl("div", o); },
     createEl(t, o = {}) { const child = fakeEl(t, o); this.children.push(child); return child; },
     setText(text) { this.text = text; },
@@ -59,6 +59,7 @@ function fixture(options = {}) {
 
   class Plugin {
     async loadData() { return options.settings || {}; }
+    async saveData(data) { this.saved = JSON.parse(JSON.stringify(data)); }
     addSettingTab() {}
     addCommand(command) { this.commands = { ...this.commands, [command.id]: command }; if (!this.command) this.command = command; }
     registerMarkdownCodeBlockProcessor(name, processor) { this.processor = processor; }
@@ -111,7 +112,7 @@ function fixture(options = {}) {
   const context = {
     module: { exports: {} },
     process: { env: { PATH: bin }, platform: "linux", kill(pid) { if (!livePids.has(pid)) { const error = new Error("no process"); error.code = "ESRCH"; throw error; } } },
-    setTimeout: (callback) => setImmediate(callback),
+    setTimeout: (callback) => { if (options.onTimeout) options.onTimeout(sessionDir); setImmediate(callback); },
     require(name) {
       if (name === "obsidian") return { Plugin, PluginSettingTab, Setting, Notice };
       if (name === "os") return { homedir: () => home };
@@ -205,6 +206,27 @@ test("focuses a live Pi pane in another Rex session, even if its cwd is gone", a
   assert.equal(f.calls.some(({ args }) => args[1] === "new" || args[1] === "rename"), false);
   assert.ok(f.calls.some(({ args }) => args.join(" ") === "focus -s session:other block:live"));
   assert.ok(f.calls.some(({ args }) => args.includes("session_id=session:other") && args.includes("window_id=window:live")));
+});
+
+test("waits for the Pi session name before it names the Rex tab", async (t) => {
+  let polls = 0;
+  const f = fixture({ onTimeout(dir) {
+    const file = path.join(dir, `test_${ID}.jsonl`);
+    if (++polls === 5 && fs.existsSync(file)) fs.appendFileSync(file, JSON.stringify({ type: "session_info", name: "Late name" }) + "\n");
+  } }); t.after(f.cleanup);
+  await f.plugin.onload();
+  await f.plugin.startSession(f.editor, { file: {} });
+  const rename = f.calls.find(({ args }) => args[0] === "window" && args[1] === "rename")?.args;
+  assert.deepEqual(rename, ["window", "rename", "-s", "session:vault", "--", "window:new", "Late name"]);
+  assert.ok(f.editor.text.includes(ID));
+});
+
+test("inserts the card without a name after the name wait ends", async (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  await f.plugin.onload();
+  await f.plugin.startSession(f.editor, { file: {} });
+  assert.equal(f.calls.find(({ args }) => args[1] === "rename"), undefined);
+  assert.ok(f.editor.text.includes(ID));
 });
 
 test("names a new Rex tab only after the extension labels its block", async (t) => {
@@ -409,7 +431,7 @@ test("renders the default card with metadata and the last reply", async (t) => {
   assert.ok(shown.some((text) => text.includes("1 user / 1 assistant")));
 });
 
-test("renders the compact card with the title, start time, message count, ID, and button only", async (t) => {
+test("renders the compact card with the title, prompt, start time, message count, ID, and button only", async (t) => {
   const f = fixture({ settings: { cardLayout: "compact" } }); t.after(f.cleanup);
   writeSession(f.home);
   await f.plugin.onload();
@@ -417,7 +439,24 @@ test("renders the compact card with the title, start time, message count, ID, an
   f.plugin.processor(ID, el);
   assert.equal(el.children[0].cls, "pi-session-card pi-session-compact");
   const start = new Date("2026-01-01T00:00:00Z").toLocaleString();
-  assert.deepEqual(texts(el), ["fix the test", `${start}  ·  2 messages`, ID, "Open in Rex"]);
+  assert.deepEqual(texts(el), ["fix the test", "first prompt", `${start}  ·  2 messages`, ID, "Open in Rex"]);
+  const prompt = el.children[0].children[1];
+  assert.equal(prompt.cls, "pi-session-prompt");
+  assert.equal(prompt.attr.title, "first prompt");
+});
+
+test("cuts the compact prompt to 300 characters and keeps the full prompt in the tooltip", async (t) => {
+  const f = fixture({ settings: { cardLayout: "compact" } }); t.after(f.cleanup);
+  writeSession(f.home);
+  const long = "x".repeat(400);
+  const file = path.join(f.home, ".pi", "agent", "sessions", "--home--", `test_${ID}.jsonl`);
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("first prompt", long));
+  await f.plugin.onload();
+  const el = fakeEl();
+  f.plugin.processor(ID, el);
+  const prompt = el.children[0].children[1];
+  assert.equal(prompt.text, `${"x".repeat(300)}...`);
+  assert.equal(prompt.attr.title, long);
 });
 
 test("refreshes cards from the command and reads the session file again", async (t) => {
@@ -428,9 +467,123 @@ test("refreshes cards from the command and reads the session file again", async 
   f.plugin.processor(ID, el);
   const file = path.join(f.home, ".pi", "agent", "sessions", "--home--", `test_${ID}.jsonl`);
   fs.appendFileSync(file, JSON.stringify({ type: "session_info", name: "renamed" }) + "\n");
-  f.plugin.commands["refresh-pi-session-cards"].callback();
+  await f.plugin.commands["refresh-pi-session-cards"].callback();
   assert.equal(texts(el)[0], "renamed");
-  assert.ok(f.notices.includes("Refreshed 1 Pi session card."));
+  assert.ok(f.notices.includes("Refreshed 1 Pi session card. Updated 0 titles from Rex."));
+});
+
+const piTab = (label, blockLabels) => ({
+  label, window_id: `window:${label}`,
+  layers: [{ blocks: blockLabels.map((blockLabel, i) => ({ creator_name: "com.superlogical.terminal", block_id: `block:${label}:${i}`, label: blockLabel })) }],
+});
+
+test("shows the Rex tab name on the card after a refresh and keeps it after the tab closes", async (t) => {
+  const windows = [piTab("Checkout fix", [`pi:${ID}`])];
+  const f = fixture({ settings: { cardLayout: "compact" }, windows }); t.after(f.cleanup);
+  writeSession(f.home);
+  await f.plugin.onload();
+  const el = fakeEl();
+  f.plugin.processor(ID, el);
+  assert.equal(texts(el)[0], "fix the test");
+  await f.plugin.commands["refresh-pi-session-cards"].callback();
+  assert.equal(texts(el)[0], "Checkout fix");
+  assert.deepEqual(f.plugin.saved.tabNames, { [ID]: "Checkout fix" });
+  assert.ok(f.notices.includes("Refreshed 1 Pi session card. Updated 1 title from Rex."));
+  windows.length = 0;
+  await f.plugin.commands["refresh-pi-session-cards"].callback();
+  assert.equal(texts(el)[0], "Checkout fix");
+});
+
+test("ignores default Rex tab names, plugin labels, and tabs with more than one Pi pane", async (t) => {
+  const windows = [piTab("Window 635b87d7", [`pi:${ID}`]), piTab(`pi:${ID}`, [`pi:${ID}`]), piTab("Two panes", [`pi:${ID}`, "pi:other"]), piTab("Shell only", ["shell"])];
+  const f = fixture({ settings: { cardLayout: "compact" }, windows }); t.after(f.cleanup);
+  writeSession(f.home);
+  await f.plugin.onload();
+  const el = fakeEl();
+  f.plugin.processor(ID, el);
+  await f.plugin.commands["refresh-pi-session-cards"].callback();
+  assert.equal(texts(el)[0], "fix the test");
+  assert.equal(f.plugin.saved, undefined);
+});
+
+test("refreshes cards when Rex is not available", async (t) => {
+  const f = fixture({ settings: { cardLayout: "compact" } }); t.after(f.cleanup);
+  writeSession(f.home);
+  fs.rmSync(path.join(f.bin, "rex"));
+  await f.plugin.onload();
+  f.plugin.processor(ID, fakeEl());
+  await f.plugin.commands["refresh-pi-session-cards"].callback();
+  assert.ok(f.notices.some((notice) => notice.startsWith("Refreshed 1 Pi session card. Could not read Rex tab names.")));
+});
+
+test("opens a new Rex tab with the card title and saves the tab name", async (t) => {
+  const f = fixture({ settings: { tabNames: { [ID]: "Saved tab name" } } }); t.after(f.cleanup);
+  writeSession(f.home);
+  await f.plugin.onload();
+  const el = fakeEl();
+  f.plugin.processor(ID, el);
+  assert.equal(texts(el)[0], "Saved tab name");
+  const button = el.children[0].children.at(-1).children.at(-1);
+  await button.click();
+  const rename = f.calls.find(({ args }) => args[0] === "window" && args[1] === "rename")?.args;
+  assert.equal(rename.at(-1), "Saved tab name");
+});
+
+test("shows the title from the block before the Rex tab name and the session name", async (t) => {
+  const f = fixture({ settings: { cardLayout: "compact", tabNames: { [ID]: "Saved tab name" } } }); t.after(f.cleanup);
+  writeSession(f.home);
+  await f.plugin.onload();
+  for (const source of [`title: exploration\n${ID}\n`, `${ID}\n  Title :  exploration  \n`]) {
+    const el = fakeEl();
+    f.plugin.processor(source, el);
+    assert.equal(texts(el)[0], "exploration");
+    assert.ok(texts(el).includes(ID));
+  }
+  const empty = fakeEl();
+  f.plugin.processor(`title:\n${ID}`, empty);
+  assert.equal(texts(empty)[0], "Saved tab name");
+});
+
+test("reads the ID from an id key or a bare line", async (t) => {
+  const f = fixture({ settings: { cardLayout: "compact" } }); t.after(f.cleanup);
+  writeSession(f.home);
+  await f.plugin.onload();
+  const sources = [
+    `${ID}`,
+    `id: ${ID}`,
+    `title: exploration\nid: ${ID}`,
+    `ID :  ${ID}  \ntitle: exploration`,
+    `id: ${ID}\nother line`,
+    `unknown: value\n${ID}`,
+  ];
+  for (const source of sources) {
+    const el = fakeEl();
+    f.plugin.processor(source, el);
+    assert.equal(el.children[0].children.at(-1).children[0].text, ID, source);
+  }
+  const missing = fakeEl();
+  f.plugin.processor("title: exploration", missing);
+  assert.equal(texts(missing)[0], "Session not found: ");
+});
+
+test("keeps the block title after a refresh and uses it for a new Rex tab", async (t) => {
+  const f = fixture({ windows: [piTab("Rex name", ["shell"])] }); t.after(f.cleanup);
+  writeSession(f.home);
+  await f.plugin.onload();
+  const el = fakeEl();
+  f.plugin.processor(`title: exploration\n${ID}`, el);
+  await f.plugin.commands["refresh-pi-session-cards"].callback();
+  assert.equal(texts(el)[0], "exploration");
+  await el.children[0].children.at(-1).children.at(-1).click();
+  const rename = f.calls.find(({ args }) => args[0] === "window" && args[1] === "rename")?.args;
+  assert.equal(rename.at(-1), "exploration");
+});
+
+test("saves the Rex tab name after it starts a session", async (t) => {
+  const f = fixture({ name: "A name" }); t.after(f.cleanup);
+  await f.plugin.onload();
+  await f.plugin.startSession(f.editor, { file: {} });
+  assert.deepEqual(f.plugin.saved.tabNames, { [ID]: "A name" });
 });
 
 test("re-renders connected cards when the layout changes", async (t) => {
