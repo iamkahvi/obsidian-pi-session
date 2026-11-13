@@ -102,7 +102,11 @@ function fixture(options = {}) {
         ? { session_id: sessionId, initial_windows: [{ window_id: "window:new", block_ids: ["block:new"] }] }
         : { window_id: "window:new", block_ids: ["block:new"] };
     } else if (args[0] === "client") {
-      result = { clients: [{ client_id: "client:app", info: { kind: "app" }, connection_state: "connected" }] };
+      const app = { client_id: "client:app", info: { kind: "app" }, connection_state: "connected" };
+      const connected = options.appConnected ? options.appConnected(calls) : true;
+      result = { clients: connected ? [app] : [] };
+    } else if (command === "/usr/bin/osascript" && options.failActivate) {
+      return callback(new Error("not allowed"), "", "not allowed");
     } else if (args[0] === "-C" && options.failSelect) {
       return callback(new Error("Remote Control is off"), "", "Remote Control is off");
     }
@@ -111,7 +115,7 @@ function fixture(options = {}) {
 
   const context = {
     module: { exports: {} },
-    process: { env: { PATH: bin }, platform: "linux", kill(pid) { if (!livePids.has(pid)) { const error = new Error("no process"); error.code = "ESRCH"; throw error; } } },
+    process: { env: { PATH: bin }, platform: options.platform || "linux", kill(pid) { if (!livePids.has(pid)) { const error = new Error("no process"); error.code = "ESRCH"; throw error; } } },
     setTimeout: (callback) => { if (options.onTimeout) options.onTimeout(sessionDir); setImmediate(callback); },
     require(name) {
       if (name === "obsidian") return { Plugin, PluginSettingTab, Setting, Notice };
@@ -409,6 +413,42 @@ test("reopens a Pi tab after its process exits", async (t) => {
   const result = await f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home);
   assert.equal(result, "Opened the Pi session in Rex.");
   assert.ok(f.calls.some(({ args }) => args.includes("--session") && args.includes("/session.jsonl")));
+});
+
+const ACTIVATE = ["-e", 'tell application id "com.superlogical.rex" to activate'];
+const appSteps = (calls) => calls
+  .filter(({ command, args }) => command === "/usr/bin/osascript" || command === "/usr/bin/open" || args[0] === "focus" || args[0] === "-C")
+  .map(({ command, args }) => command === "/usr/bin/osascript" ? "activate" : command === "/usr/bin/open" ? "open" : args[0] === "focus" ? "focus" : "select");
+
+test("selects the Rex tab before it activates Rex with AppleScript", async (t) => {
+  const f = fixture({ platform: "darwin" }); t.after(f.cleanup);
+  await f.plugin.onload();
+  await f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home);
+  assert.deepEqual(appSteps(f.calls), ["focus", "select", "activate"]);
+  assert.deepEqual(f.calls.find(({ command }) => command === "/usr/bin/osascript").args, ACTIVATE);
+});
+
+test("activates Rex, waits for the app, selects the tab, and activates Rex again", async (t) => {
+  const f = fixture({ platform: "darwin", appConnected: (calls) => calls.some(({ command }) => command === "/usr/bin/osascript") }); t.after(f.cleanup);
+  await f.plugin.onload();
+  await f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home);
+  assert.deepEqual(appSteps(f.calls), ["focus", "activate", "select", "activate"]);
+});
+
+test("does not activate Rex outside macOS", async (t) => {
+  const f = fixture(); t.after(f.cleanup);
+  await f.plugin.onload();
+  await f.helpers.openInRex(f.plugin.settings, "/session.jsonl", ID, f.home);
+  assert.deepEqual(appSteps(f.calls), ["focus", "select"]);
+});
+
+test("reports a missing Rex app and a denied activation", async (t) => {
+  const a = fixture({ appConnected: () => false }); t.after(a.cleanup);
+  await a.plugin.onload();
+  await assert.rejects(a.helpers.openInRex(a.plugin.settings, "/session.jsonl", ID, a.home), /Rex app did not connect/);
+  const b = fixture({ platform: "darwin", failActivate: true }); t.after(b.cleanup);
+  await b.plugin.onload();
+  await assert.rejects(b.helpers.openInRex(b.plugin.settings, "/session.jsonl", ID, b.home), /Allow Obsidian to control Rex/);
 });
 
 test("rejects duplicate vault session labels", async (t) => {

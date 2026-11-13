@@ -52,7 +52,7 @@ title: exploration
 
 The `title:` line replaces the Rex tab name and the Pi session name. It also names a new Rex tab when you click **Open in Rex**. A block that contains only the session ID also works.
 
-Do not open a Pi session in two processes. The plugin cannot detect sessions outside Rex or sessions without the extension label. It shows a notice if it cannot verify a labeled pane. Rex Remote Control must be on to select a tab in the app.
+Do not open a Pi session in two processes. The plugin cannot detect sessions outside Rex or sessions without the extension label. It shows a notice if it cannot verify a labeled pane. Rex Remote Control must be on to select a tab in the app. The first time, macOS can ask you to let Obsidian control Rex.
 
 If Obsidian stops during a request, confirm that no request is active. Then remove the lock file shown in the notice.
 

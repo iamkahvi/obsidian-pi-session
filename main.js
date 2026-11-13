@@ -101,24 +101,42 @@ async function findVaultSession(rex) {
   return matches[0] || null;
 }
 
+// Use the AppleScript activate event. "open -b" sends a reopen event, and Rex then does not
+// switch to a full-screen window in another Space.
+async function activateRex() {
+  if (process.platform !== "darwin") return;
+  try {
+    await run("/usr/bin/osascript", ["-e", `tell application id "${REX_APP_BUNDLE}" to activate`]);
+  } catch (error) {
+    throw new Error(`Could not activate Rex. Allow Obsidian to control Rex in System Settings > Privacy & Security > Automation. ${error.message}`);
+  }
+}
+
+async function connectedRexApp(rex) {
+  const { clients } = await rexJson(rex, ["client", "ls", "--json"]);
+  const apps = (clients || []).filter((client) => client.info?.kind === "app" && client.connection_state === "connected");
+  if (apps.length > 1) throw new Error("More than one Rex app is connected. Select the session in Rex.");
+  return apps[0] || null;
+}
+
+// Select the tab before activation, so Rex shows the correct tab when its Space comes forward.
 async function showInRex(rex, sessionId, windowId, blockId) {
   if (blockId) await run(rex, ["focus", "-s", sessionId, blockId]);
-  if (process.platform === "darwin") await run("/usr/bin/open", ["-b", REX_APP_BUNDLE]);
-  for (let i = 0; i < 50; i++) {
-    const { clients } = await rexJson(rex, ["client", "ls", "--json"]);
-    const apps = (clients || []).filter((client) => client.info?.kind === "app" && client.connection_state === "connected");
-    if (apps.length > 1) throw new Error("More than one Rex app is connected. Select the session in Rex.");
-    if (apps.length === 1) {
-      try {
-        await run(rex, ["-C", apps[0].client_id, "do", "session.select", `session_id=${sessionId}`, `window_id=${windowId}`]);
-      } catch (error) {
-        throw new Error(`Could not select the Rex tab. Check Rex Remote Control. ${error.message}`);
-      }
-      return;
+  let app = await connectedRexApp(rex);
+  if (!app) {
+    await activateRex();
+    for (let i = 0; !app && i < 50; i++) {
+      await sleep(200);
+      app = await connectedRexApp(rex);
     }
-    await sleep(200);
+    if (!app) throw new Error("Rex app did not connect. Select the session in Rex.");
   }
-  throw new Error("Rex app did not connect. Select the session in Rex.");
+  try {
+    await run(rex, ["-C", app.client_id, "do", "session.select", `session_id=${sessionId}`, `window_id=${windowId}`]);
+  } catch (error) {
+    throw new Error(`Could not select the Rex tab. Check Rex Remote Control. ${error.message}`);
+  }
+  await activateRex();
 }
 
 const piLabel = (id) => `pi:${id}`;
